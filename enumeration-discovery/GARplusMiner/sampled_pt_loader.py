@@ -34,6 +34,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from graph_types import DataGraph, FrequentPattern, GraphInstance, GraphPattern, Vertex
 from ppi_loader import _assign_degree_features, _edge_attrs_from_row, _merge_vertex, _normalize_edge_label, _normalize_key, _normalize_scalar, _protein_vertex_from_row
+from structural_edge_label import structural_edge_label
 
 
 def _tensor_to_list(value) -> list:
@@ -166,7 +167,7 @@ def _interaction_node_id(row: Dict[str, str], suffix: str) -> Optional[int]:
     return int(normalized) if normalized is not None else None
 
 
-def _load_interaction_lookup(path: Optional[str], edge_label_column: str = "Experimental System", force_edge_label: Optional[str] = None) -> Dict[Tuple[int, int], Tuple[str, Dict[str, object]]]:
+def _load_interaction_lookup(path: Optional[str], edge_label_column: str = "Experimental System", force_edge_label: Optional[str] = None, structural_edge_label_enabled: bool = False, structural_edge_label_attr: Optional[str] = None) -> Dict[Tuple[int, int], Tuple[str, Dict[str, object]]]:
     """Build `(src_original_id, dst_original_id) -> (edge_label, edge_attrs)` lookup."""
 
     lookup: Dict[Tuple[int, int], Tuple[str, Dict[str, object]]] = {}
@@ -179,9 +180,15 @@ def _load_interaction_lookup(path: Optional[str], edge_label_column: str = "Expe
             right = _interaction_node_id(row, "B")
             if left is None or right is None:
                 continue
-            edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, "sampled_interaction"))
             edge_attrs = _edge_attrs_from_row(row)
             edge_attrs["source_row_id"] = row_index
+            base_edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, "sampled_interaction"))
+            edge_label = structural_edge_label(
+                base_edge_label,
+                edge_attrs,
+                enabled=structural_edge_label_enabled,
+                attr_key=structural_edge_label_attr,
+            )
             lookup[(left, right)] = (edge_label, edge_attrs)
             lookup.setdefault((right, left), (edge_label, dict(edge_attrs, direction_role="reverse_lookup")))
     return lookup
@@ -266,6 +273,8 @@ def _append_negative_edges(
     interaction_path: Optional[str],
     edge_label_column: str,
     force_edge_label: Optional[str],
+    structural_edge_label_enabled: bool,
+    structural_edge_label_attr: Optional[str],
     negative_edge_limit: int,
     label_column: str = "interaction_label",
     negative_value: str = "negative",
@@ -295,9 +304,15 @@ def _append_negative_edges(
         next_node_id += 2
         _ensure_augmented_vertex(vertices, left, protein_attrs, src_node, augmented_graph_id)
         _ensure_augmented_vertex(vertices, right, protein_attrs, dst_node, augmented_graph_id)
-        edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, "negative_interaction"))
         edge_attrs = dict(attrs)
         edge_attrs.setdefault(label_column, negative_value)
+        base_edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, "negative_interaction"))
+        edge_label = structural_edge_label(
+            base_edge_label,
+            edge_attrs,
+            enabled=structural_edge_label_enabled,
+            attr_key=structural_edge_label_attr,
+        )
         edge_attrs.setdefault("sampled_graph_id", augmented_graph_id)
         edge_attrs.setdefault("augmented_negative_edge", "yes")
         edge_attrs.setdefault("sampled_src_original_id", left)
@@ -466,6 +481,8 @@ def load_sampled_pt_graph(
     keep_sampled_x: bool = True,
     use_original_ids_as_node_ids: bool = False,
     force_edge_label: Optional[str] = None,
+    structural_edge_label_enabled: bool = False,
+    structural_edge_label_attr: Optional[str] = None,
     augment_negative_edges: bool = False,
     negative_edge_limit: int = 0,
     interaction_label_column: str = "interaction_label",
@@ -479,7 +496,13 @@ def load_sampled_pt_graph(
         raise ValueError(f"{sampled_pt_path} does not look like a PyG Data object with edge_index")
 
     protein_attrs = _load_protein_attrs(protein_path, index_column=protein_index_column)
-    interaction_lookup = _load_interaction_lookup(interaction_path, edge_label_column=edge_label_column, force_edge_label=force_edge_label)
+    interaction_lookup = _load_interaction_lookup(
+        interaction_path,
+        edge_label_column=edge_label_column,
+        force_edge_label=force_edge_label,
+        structural_edge_label_enabled=structural_edge_label_enabled,
+        structural_edge_label_attr=structural_edge_label_attr,
+    )
 
     vertices: Dict[int, Vertex] = {}
     pending_edges = []
@@ -524,6 +547,13 @@ def load_sampled_pt_graph(
             orig_dst = int(orig_ids[local_dst])
             edge_label, edge_attrs = interaction_lookup.get((orig_src, orig_dst), (force_edge_label or default_edge_label, {}))
             attrs = dict(edge_attrs)
+            if not edge_attrs:
+                edge_label = structural_edge_label(
+                    edge_label,
+                    attrs,
+                    enabled=structural_edge_label_enabled,
+                    attr_key=structural_edge_label_attr,
+                )
             attrs.setdefault("sampled_graph_id", graph_id)
             attrs.setdefault("sampled_edge_id", sampled_edge_id)
             attrs.setdefault("sampled_src_local_id", local_src)
@@ -543,6 +573,8 @@ def load_sampled_pt_graph(
             interaction_path=interaction_path,
             edge_label_column=edge_label_column,
             force_edge_label=force_edge_label,
+            structural_edge_label_enabled=structural_edge_label_enabled,
+            structural_edge_label_attr=structural_edge_label_attr,
             negative_edge_limit=negative_edge_limit,
             label_column=interaction_label_column,
             negative_value="negative",

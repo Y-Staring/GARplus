@@ -1,5 +1,17 @@
 ﻿# GAR Python Port Flow
 
+## GARplusMiner Sync Notes
+
+The structural mining layer now follows the current `GARplusMiner` VSpawn
+implementation: frontier-based rounds, topology-only deduplication, optional
+global parent rematching, incremental add-edge instance extension, debug
+statistics, and the same `PatternOptions` knobs used by the GARplus demo.
+
+This port intentionally stops before GAR+ semantics: no synthetic negative-edge
+rule mining, no negated predicates, no broader comparison-operator mining, and
+no pattern/predicate BN optimization is enabled by the demo. Predicate mining
+remains GAR-style association rule discovery over positive literals.
+
 ## Overall pipeline
 
 The current Python GAR port follows this order:

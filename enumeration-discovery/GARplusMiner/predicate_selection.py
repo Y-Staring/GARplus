@@ -11,6 +11,7 @@ For one fixed frequent pattern we:
 
 from collections import Counter
 from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Dict, List, Tuple, Optional, Any, Callable
 
 from graph_types import DataGraph, FrequentPattern, instance_literals
@@ -34,13 +35,27 @@ class PredicateTableMixin:
         self,
         min_value_support_count: int = 1,
         drop_target_values: Optional[set] = None,
+        allowed_consequent_values: Optional[set] = None,
         drop_feature_key_tokens: Optional[tuple[str, ...]] = None,
+        drop_target_entity_features: bool = False,
+        debug_literal_keys: bool = False,
+        debug_literal_instance_limit: int = 1,
+        debug_transaction_cost: bool = False,
+        predicate_focus_item: Optional[str] = None,
     ) -> None:
         self.min_value_support_count = max(1, int(min_value_support_count))
         self.drop_target_values = set(drop_target_values or [])
+        self.allowed_consequent_values = {str(value) for value in (allowed_consequent_values or set())}
         self.drop_feature_key_tokens = tuple(token.lower() for token in (drop_feature_key_tokens or ()) if token)
+        self.drop_target_entity_features = drop_target_entity_features
+        self.debug_literal_keys = debug_literal_keys
+        self.debug_literal_instance_limit = max(0, int(debug_literal_instance_limit))
+        self.debug_transaction_cost = debug_transaction_cost
+        self.predicate_focus_item = predicate_focus_item
+        self.current_pattern_id: Optional[int] = None
         self.filtered_feature_keys: set[str] = set()
         self.diagnostics: List[Dict[str, object]] = []
+        self.target_stage_summary: Dict[str, object] = {}
 
     def min_support_count(self, total_rows: int) -> int:
         """Convert configured support threshold to paper-style absolute support."""
@@ -52,6 +67,7 @@ class PredicateTableMixin:
     def reset_diagnostics(self) -> None:
         self.diagnostics = []
         self.filtered_feature_keys = set()
+        self.target_stage_summary = {}
 
     def record_diagnostic(self, antecedent: Tuple[str, ...], consequent: str, support: int, confidence: float, lift: float, reason: str) -> None:
         self.diagnostics.append(
@@ -77,13 +93,21 @@ class PredicateTableMixin:
     def positive_diagnostics(self, limit: int = 20) -> List[Dict[str, object]]:
         return self.target_value_diagnostics("positive", limit=limit)
 
+    def is_allowed_consequent_value(self, value: object) -> bool:
+        return not self.allowed_consequent_values or str(value) in self.allowed_consequent_values
+
     def build_instance_rows(self, graph: DataGraph, frequent_pattern: FrequentPattern) -> List[Dict[str, object]]:
         """Convert all matched instances of one pattern into row dictionaries."""
 
         rows: List[Dict[str, object]] = []
-        for instance in frequent_pattern.instances:
+        for instance_index, instance in enumerate(frequent_pattern.instances):
             row: Dict[str, object] = {}
-            for record in instance_literals(graph, frequent_pattern.pattern, instance):
+            for record in instance_literals(
+                graph,
+                frequent_pattern.pattern,
+                instance,
+                debug=self.debug_literal_keys and instance_index < self.debug_literal_instance_limit,
+            ):
                 literal_key = f"{record.entity}.{record.key}"
                 if literal_key not in row:
                     row[literal_key] = record.value
@@ -96,7 +120,116 @@ class PredicateTableMixin:
                         row[literal_key] = [existing, record.value]
             normalized = {key: ("|".join(str(v) for v in value) if isinstance(value, list) else value) for key, value in row.items()}
             rows.append(normalized)
+        if self.debug_literal_keys and rows:
+            keys = sorted({key for row in rows for key in row})
+            v_keys = [key for key in keys if key.startswith("v")]
+            e_keys = [key for key in keys if key.startswith("e")]
+            print(f"[LiteralKeys] pattern_id={frequent_pattern.pattern.pattern_id}")
+            print(f"  rows={len(rows)} total_keys={len(keys)} v_keys={len(v_keys)} e_keys={len(e_keys)}")
+            print(f"  v_keys_sample={v_keys[:50]}")
+            print(f"  e_keys_sample={e_keys[:50]}")
         return rows
+
+    def _instance_edge_pair(self, graph: DataGraph, frequent_pattern: FrequentPattern, instance_index: int, edge_index: int = 0) -> Optional[tuple[str, str]]:
+        if instance_index >= len(frequent_pattern.instances) or edge_index >= len(frequent_pattern.pattern.edges):
+            return None
+        instance = frequent_pattern.instances[instance_index]
+        edge_id = instance.get_edge_id(edge_index)
+        edge = graph.edges_by_id.get(edge_id) if edge_id is not None else None
+        if edge is not None:
+            return str(edge.src), str(edge.dst)
+        pattern_edge = frequent_pattern.pattern.edges[edge_index]
+        src = instance.node_map.get(pattern_edge.src)
+        dst = instance.node_map.get(pattern_edge.dst)
+        if src is None or dst is None:
+            return None
+        return str(src), str(dst)
+
+    def print_pattern_label_debug(
+        self,
+        graph: DataGraph,
+        frequent_pattern: FrequentPattern,
+        rows: List[Dict[str, object]],
+        y_key: str,
+    ) -> None:
+        if not self.debug_transaction_cost:
+            return
+        label_counts = Counter(str(row.get(y_key)) for row in rows if y_key in row)
+        unique_pair_labels: Dict[tuple[str, str], object] = {}
+        for row_index, row in enumerate(rows):
+            if y_key not in row:
+                continue
+            pair = self._instance_edge_pair(graph, frequent_pattern, row_index, 0)
+            if pair is not None:
+                unique_pair_labels.setdefault(pair, row.get(y_key))
+        unique_counts = Counter(str(value) for value in unique_pair_labels.values())
+        pattern_id = frequent_pattern.pattern.pattern_id
+        print(f"[PatternLabelDist] pattern_id={pattern_id} {y_key}={dict(label_counts)}")
+        print(
+            f"[PatternUniqueE0LabelDist] pattern_id={pattern_id} unique_e0={len(unique_pair_labels)} "
+            f"label_dist={dict(unique_counts)}"
+        )
+
+    def print_row_source_debug(self, rows: List[Dict[str, object]], y_key: str, label: str = "TransactionDebug") -> None:
+        if not self.debug_transaction_cost:
+            return
+        pattern_id = self.current_pattern_id
+        row_lengths = [len(row) for row in rows]
+        total_keys = sorted({key for row in rows for key in row})
+        avg_len = sum(row_lengths) / len(row_lengths) if row_lengths else 0.0
+        median_len = 0
+        if row_lengths:
+            sorted_lengths = sorted(row_lengths)
+            middle = len(sorted_lengths) // 2
+            median_len = (
+                sorted_lengths[middle]
+                if len(sorted_lengths) % 2
+                else (sorted_lengths[middle - 1] + sorted_lengths[middle]) / 2
+            )
+        min_support = self.min_support_count(len(rows)) if rows else 0
+        print(
+            f"[{label}] pattern_id={pattern_id} rows={len(rows)} keys={len(total_keys)} "
+            f"avg_len={avg_len:.1f} median_len={median_len} "
+            f"max_len={max(row_lengths) if row_lengths else 0} "
+            f"min_support={min_support} min_value_support_count={self.min_value_support_count} "
+            f"y_key={y_key} focus={self.predicate_focus_item}"
+        )
+
+        source_counts: Dict[str, set] = {}
+        attr_presence: Counter = Counter()
+        attr_values: Dict[str, set] = {}
+        for row in rows:
+            for key, value in row.items():
+                entity = key.split(".", 1)[0]
+                source_counts.setdefault(entity, set()).add(key)
+                attr_presence[key] += 1
+                attr_values.setdefault(key, set()).add(str(value))
+        source_summary = {entity: len(keys) for entity, keys in sorted(source_counts.items())}
+        high_freq = attr_presence.most_common(20)
+        high_cardinality = sorted(
+            ((key, len(values)) for key, values in attr_values.items()),
+            key=lambda item: (item[1], attr_presence[item[0]]),
+            reverse=True,
+        )[:20]
+        print(f"[LiteralSourceCounts] pattern_id={pattern_id} {source_summary}")
+        print(f"[HighFrequencyAttrs] pattern_id={pattern_id} top={high_freq}")
+        print(f"[HighCardinalityAttrs] pattern_id={pattern_id} top={high_cardinality}")
+
+    def print_frequent_itemsets_cost(self, transactions: List[List[str]]) -> None:
+        if not self.debug_transaction_cost:
+            return
+        lengths = [len(transaction) for transaction in transactions]
+        avg_len = sum(lengths) / len(lengths) if lengths else 0.0
+        pair_updates = sum(length * (length - 1) // 2 for length in lengths)
+        print(
+            f"[FrequentItemsetsCost] rows={len(transactions)} avg_len={avg_len:.1f} "
+            f"estimated_pair_updates={pair_updates}"
+        )
+        if pair_updates > 20_000_000:
+            print(
+                "[FrequentItemsetsWarning] estimated_pair_updates too large; "
+                "consider reducing max literals, filtering high-cardinality predicates, or capping pattern instances."
+            )
 
     def filter_target_rows(self, rows: List[Dict[str, object]], y_key: str) -> List[Dict[str, object]]:
         """Drop rows whose target value should not participate in rule mining."""
@@ -105,8 +238,41 @@ class PredicateTableMixin:
             return rows
         return [row for row in rows if row.get(y_key) not in self.drop_target_values]
 
+    def prepare_target_rows(self, raw_rows: List[Dict[str, object]], y_key: str) -> List[Dict[str, object]]:
+        """Apply target-preserving preprocessing and retain stage counts for diagnostics."""
+
+        raw_counts = Counter(str(row.get(y_key)) for row in raw_rows if y_key in row)
+        value_pruned_rows = self.prune_rows_by_value_support(raw_rows, preserve_keys={y_key})
+        target_present_rows = [row for row in value_pruned_rows if y_key in row]
+        after_value_counts = Counter(str(row.get(y_key)) for row in target_present_rows)
+        ignored_counts = Counter(
+            str(row.get(y_key))
+            for row in target_present_rows
+            if row.get(y_key) in self.drop_target_values
+        )
+        filtered_rows = self.filter_target_rows(target_present_rows, y_key)
+        after_ignored_counts = Counter(str(row.get(y_key)) for row in filtered_rows)
+        self.target_stage_summary = {
+            "y_key": y_key,
+            "raw_rows": len(raw_rows),
+            "raw_counts": dict(raw_counts),
+            "after_value_rows": len(target_present_rows),
+            "after_value_counts": dict(after_value_counts),
+            "missing_target_after_value_pruning": len(value_pruned_rows) - len(target_present_rows),
+            "ignored_counts": dict(ignored_counts),
+            "after_ignored_rows": len(filtered_rows),
+            "after_ignored_counts": dict(after_ignored_counts),
+        }
+        return filtered_rows
+
     def is_dropped_feature_key(self, key: str, y_key: Optional[str] = None) -> bool:
-        if key == y_key or not self.drop_feature_key_tokens:
+        if key == y_key:
+            return False
+        if self.drop_target_entity_features and y_key and "." in y_key:
+            target_entity = y_key.split(".", 1)[0]
+            if key.startswith(f"{target_entity}."):
+                return True
+        if not self.drop_feature_key_tokens:
             return False
         lowered = key.lower()
         return any(token in lowered for token in self.drop_feature_key_tokens)
@@ -114,7 +280,7 @@ class PredicateTableMixin:
     def filter_feature_keys(self, rows: List[Dict[str, object]], y_key: Optional[str] = None) -> List[Dict[str, object]]:
         """Remove configured shortcut/noisy feature columns from mining rows."""
 
-        if not self.drop_feature_key_tokens:
+        if not self.drop_feature_key_tokens and not self.drop_target_entity_features:
             return rows
         filtered_rows: List[Dict[str, object]] = []
         for row in rows:
@@ -127,6 +293,38 @@ class PredicateTableMixin:
             filtered_rows.append(filtered_row)
         return filtered_rows
 
+    def print_filtered_literal_keys(self, rows: List[Dict[str, object]]) -> None:
+        if not self.debug_literal_keys or not rows:
+            return
+        keys = sorted({key for row in rows for key in row})
+        v_keys = [key for key in keys if key.startswith("v")]
+        e_keys = [key for key in keys if key.startswith("e")]
+        print(f"[FilteredLiteralKeys] pattern_id={self.current_pattern_id}")
+        print(f"  rows={len(rows)} total_keys={len(keys)} v_keys={len(v_keys)} e_keys={len(e_keys)}")
+        print(f"  v_keys_sample={v_keys[:50]}")
+        print(f"  e_keys_sample={e_keys[:50]}")
+
+    def soft_bn_feature_keys(self, rows: List[Dict[str, object]], y_key: str, bn_keys: List[str]) -> List[str]:
+        """Use BN ranking as one candidate source instead of a hard feature gate."""
+
+        presence: Counter = Counter()
+        cardinalities: Dict[str, set] = {}
+        for row in rows:
+            for key, value in row.items():
+                if key == y_key or self.is_dropped_feature_key(key, y_key):
+                    continue
+                presence[key] += 1
+                cardinalities.setdefault(key, set()).add(str(value))
+        support_keys = [key for key, _ in presence.most_common(10)]
+        semantic_keys = []
+        for key in sorted(presence, key=lambda item: (len(cardinalities[item]), -presence[item], item)):
+            if any(token in key.lower() for token in ("_id", "index", "source_row", "sampled_")):
+                continue
+            semantic_keys.append(key)
+            if len(semantic_keys) >= 20:
+                break
+        return list(dict.fromkeys([*bn_keys, *support_keys, *semantic_keys]))
+
     def support_ranked_feature_keys(self, rows: List[Dict[str, object]], y_key: str, exclude: Optional[set] = None) -> List[str]:
         exclude = set(exclude or set())
         counts: Counter = Counter()
@@ -136,11 +334,12 @@ class PredicateTableMixin:
                     counts[key] += 1
         return [key for key, _ in counts.most_common(self.extra_candidate_key_count)]
 
-    def prune_rows_by_value_support(self, rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    def prune_rows_by_value_support(self, rows: List[Dict[str, object]], preserve_keys: Optional[set[str]] = None) -> List[Dict[str, object]]:
         """Drop low-support values first, then let empty columns disappear naturally."""
 
         if not rows:
             return []
+        preserve_keys = set(preserve_keys or set())
         value_counts: Dict[str, Counter] = {}
         for row in rows:
             for key, value in row.items():
@@ -148,7 +347,7 @@ class PredicateTableMixin:
 
         allowed_values: Dict[str, set] = {}
         for key, counts in value_counts.items():
-            kept = {value for value, count in counts.items() if count >= self.min_value_support_count}
+            kept = set(counts) if key in preserve_keys else {value for value, count in counts.items() if count >= self.min_value_support_count}
             if kept:
                 allowed_values[key] = kept
 
@@ -178,10 +377,26 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
         min_value_support_count: int = 1,
         predicate_bn: Optional[Any] = None,
         drop_target_values: Optional[set] = None,
+        allowed_consequent_values: Optional[set] = None,
         drop_feature_key_tokens: Optional[tuple[str, ...]] = None,
+        drop_target_entity_features: bool = False,
         max_depth: int = 3,
+        debug_literal_keys: bool = False,
+        debug_literal_instance_limit: int = 1,
+        debug_transaction_cost: bool = False,
+        predicate_focus_item: Optional[str] = None,
     ) -> None:
-        super().__init__(min_value_support_count=min_value_support_count, drop_target_values=drop_target_values, drop_feature_key_tokens=drop_feature_key_tokens)
+        super().__init__(
+            min_value_support_count=min_value_support_count,
+            drop_target_values=drop_target_values,
+            allowed_consequent_values=allowed_consequent_values,
+            drop_feature_key_tokens=drop_feature_key_tokens,
+            drop_target_entity_features=drop_target_entity_features,
+            debug_literal_keys=debug_literal_keys,
+            debug_literal_instance_limit=debug_literal_instance_limit,
+            debug_transaction_cost=debug_transaction_cost,
+            predicate_focus_item=predicate_focus_item,
+        )
         self.min_support = min_support
         self.min_confidence = min_confidence
         self.predicate_bn = predicate_bn
@@ -190,10 +405,7 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
     def generate_literal_df(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_key: str) -> List[Dict[str, object]]:
         """Build the per-pattern table and keep only rows that still contain the target."""
 
-        rows = self.build_instance_rows(graph, frequent_pattern)
-        rows = self.prune_rows_by_value_support(rows)
-        rows = [row for row in rows if y_key in row]
-        rows = self.filter_target_rows(rows, y_key)
+        rows = self.prepare_target_rows(self.build_instance_rows(graph, frequent_pattern), y_key)
         return self.filter_feature_keys(rows, y_key)
 
     def generate_scoring_rows(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_key: str) -> List[Dict[str, object]]:
@@ -299,14 +511,23 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
         """Generate path-based decision-tree rules, aligned with the Go implementation."""
 
         self.reset_diagnostics()
-        rows = self.generate_literal_df(graph, frequent_pattern, y_key)
-        scoring_rows = self.generate_scoring_rows(graph, frequent_pattern, y_key)
+        self.current_pattern_id = frequent_pattern.pattern.pattern_id
+        raw_rows = self.build_instance_rows(graph, frequent_pattern)
+        self.print_pattern_label_debug(graph, frequent_pattern, raw_rows, y_key)
+        rows = self.prepare_target_rows(raw_rows, y_key)
+        rows = self.filter_feature_keys(rows, y_key)
+        self.print_filtered_literal_keys(rows)
+        scoring_rows = [row for row in raw_rows if y_key in row]
+        scoring_rows = self.filter_target_rows(scoring_rows, y_key)
+        scoring_rows = self.filter_feature_keys(scoring_rows, y_key)
+        self.print_row_source_debug(rows, y_key)
         if not rows or not scoring_rows:
             return []
         if self.predicate_bn is not None:
             self.predicate_bn.fit_rows(rows, y_key)
             all_feature_keys = sorted({key for row in rows for key in row.keys() if key != y_key})
-            candidate_keys = [key for _, key in self.predicate_bn.rank_feature_keys(rows, all_feature_keys)]
+            bn_keys = [key for _, key in self.predicate_bn.rank_feature_keys(rows, all_feature_keys)]
+            candidate_keys = self.soft_bn_feature_keys(rows, y_key, bn_keys)
             for dropped_key in sorted(set(all_feature_keys) - set(candidate_keys)):
                 for row in rows:
                     if row.get(y_key) == "negative" and dropped_key in row:
@@ -331,6 +552,8 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
             leaf_y_count = Counter(row.get(y_key) for row in matched_rows)
             antecedent_count = len(matched_rows)
             for y_value, pair_count in leaf_y_count.items():
+                if not self.is_allowed_consequent_value(y_value):
+                    continue
                 support = pair_count
                 confidence = pair_count / antecedent_count if antecedent_count else 0.0
                 base_rate = y_count[y_value] / len(scoring_rows)
@@ -360,11 +583,37 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
 class FPGrowthPredicateSelector(PredicateTableMixin):
     """A lightweight frequent-itemset selector."""
 
-    def __init__(self, min_support: float = 0.1, min_confidence: float = 0.5, min_value_support_count: int = 1, predicate_bn: Optional[Any] = None, drop_target_values: Optional[set] = None, drop_feature_key_tokens: Optional[tuple[str, ...]] = None) -> None:
-        super().__init__(min_value_support_count=min_value_support_count, drop_target_values=drop_target_values, drop_feature_key_tokens=drop_feature_key_tokens)
+    def __init__(
+        self,
+        min_support: float = 0.1,
+        min_confidence: float = 0.5,
+        min_value_support_count: int = 1,
+        predicate_bn: Optional[Any] = None,
+        drop_target_values: Optional[set] = None,
+        allowed_consequent_values: Optional[set] = None,
+        drop_feature_key_tokens: Optional[tuple[str, ...]] = None,
+        drop_target_entity_features: bool = False,
+        debug_literal_keys: bool = False,
+        debug_literal_instance_limit: int = 1,
+        debug_transaction_cost: bool = False,
+        predicate_focus_item: Optional[str] = None,
+        max_itemset_size: int = 3,
+    ) -> None:
+        super().__init__(
+            min_value_support_count=min_value_support_count,
+            drop_target_values=drop_target_values,
+            allowed_consequent_values=allowed_consequent_values,
+            drop_feature_key_tokens=drop_feature_key_tokens,
+            drop_target_entity_features=drop_target_entity_features,
+            debug_literal_keys=debug_literal_keys,
+            debug_literal_instance_limit=debug_literal_instance_limit,
+            debug_transaction_cost=debug_transaction_cost,
+            predicate_focus_item=predicate_focus_item,
+        )
         self.min_support = min_support
         self.min_confidence = min_confidence
         self.predicate_bn = predicate_bn
+        self.max_itemset_size = max(2, int(max_itemset_size))
 
     def get_transaction_list(self, graph: DataGraph, frequent_pattern: FrequentPattern) -> List[List[str]]:
         """Convert one pattern's matched instances into transactions."""
@@ -384,36 +633,50 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
 
         if not transactions:
             return {}
+        self.print_frequent_itemsets_cost(transactions)
         threshold = self.min_support_count(len(transactions))
-        counts: Counter = Counter()
+        counts: Counter[Tuple[str, ...]] = Counter()
         for transaction in transactions:
             for item in transaction:
                 counts[(item,)] += 1
         frequent = {items: count for items, count in counts.items() if count >= threshold}
-        pairs: Counter = Counter()
-        triples: Counter = Counter()
-        for transaction in transactions:
-            for i in range(len(transaction)):
-                for j in range(i + 1, len(transaction)):
-                    pairs[(transaction[i], transaction[j])] += 1
-                    for k in range(j + 1, len(transaction)):
-                        triples[(transaction[i], transaction[j], transaction[k])] += 1
-        frequent.update({items: count for items, count in pairs.items() if count >= threshold})
-        frequent.update({items: count for items, count in triples.items() if count >= threshold})
+        previous_frequent = set(frequent)
+        frequent_single_items = {items[0] for items in previous_frequent}
+        if not previous_frequent:
+            return frequent
+
+        for size in range(2, self.max_itemset_size + 1):
+            itemset_counts: Counter[Tuple[str, ...]] = Counter()
+            for transaction in transactions:
+                candidate_items = [item for item in transaction if item in frequent_single_items]
+                if len(candidate_items) < size:
+                    continue
+                for itemset in combinations(candidate_items, size):
+                    if size > 2 and any(tuple(subset) not in previous_frequent for subset in combinations(itemset, size - 1)):
+                        continue
+                    itemset_counts[itemset] += 1
+            current_frequent = {items: count for items, count in itemset_counts.items() if count >= threshold}
+            if not current_frequent:
+                break
+            frequent.update(current_frequent)
+            previous_frequent = set(current_frequent)
         return frequent
 
     def generate_rules(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_prefix: str) -> List[Rule]:
         """Emit association rules whose consequent belongs to the requested target prefix."""
 
         self.reset_diagnostics()
-        rows = self.prune_rows_by_value_support(self.build_instance_rows(graph, frequent_pattern))
-        rows = [row for row in rows if y_prefix in row]
-        rows = self.filter_target_rows(rows, y_prefix)
+        self.current_pattern_id = frequent_pattern.pattern.pattern_id
+        raw_rows = self.build_instance_rows(graph, frequent_pattern)
+        self.print_pattern_label_debug(graph, frequent_pattern, raw_rows, y_prefix)
+        rows = self.prepare_target_rows(raw_rows, y_prefix)
         rows = self.filter_feature_keys(rows, y_prefix)
+        self.print_filtered_literal_keys(rows)
         if self.predicate_bn is not None:
             self.predicate_bn.fit_rows(rows, y_prefix)
             all_feature_keys = sorted({key for row in rows for key in row.keys() if key != y_prefix})
-            kept_feature_keys = {key for _, key in self.predicate_bn.rank_feature_keys(rows, all_feature_keys)}
+            bn_keys = [key for _, key in self.predicate_bn.rank_feature_keys(rows, all_feature_keys)]
+            kept_feature_keys = set(self.soft_bn_feature_keys(rows, y_prefix, bn_keys))
             for dropped_key in sorted(set(all_feature_keys) - set(kept_feature_keys)):
                 for row in rows:
                     if row.get(y_prefix) == "negative" and dropped_key in row:
@@ -429,6 +692,7 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
                     transaction.append(f"{key}={value}")
             if transaction:
                 transactions.append(sorted(set(transaction)))
+        self.print_row_source_debug(rows, y_prefix)
         itemsets = self.frequent_itemsets(transactions)
         total = len(transactions) or 1
         support_threshold = self.min_support_count(total)
@@ -437,7 +701,18 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
         for items, itemset_count in itemsets.items():
             if len(items) < 2:
                 continue
-            y_items = [item for item in items if item.startswith(y_prefix)]
+            y_items = [
+                item
+                for item in items
+                if item.startswith(y_prefix)
+                and (
+                    not self.allowed_consequent_values
+                    or (
+                        "=" in item
+                        and item.split("=", 1)[1] in self.allowed_consequent_values
+                    )
+                )
+            ]
             if not y_items:
                 continue
             for consequent in y_items:

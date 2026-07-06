@@ -98,8 +98,9 @@ def get_relation_probabilities(scores, threshold):
         probs[i] = [s_0/total, s_1/total, s_2/total]
     
     return probs
-
-def evaluate_on_test_set(test_file, model, rel_tot, threshold=5.0, batch_size=1024):
+    
+def evaluate_on_test_set(test_file, model, rel_tot, threshold=5.0, batch_size=1024, save_predictions=True, 
+                         output_dir="./predictions/DDA_20pct", node_file="/mnt/f/graduate/GARplus/exp1_accuracy/exp1_accuracy/DDA_test/data_signed/node_labeled.csv"):
     """
     读取 test2id.txt 进行批量预测并计算准确率。
     """
@@ -114,16 +115,23 @@ def evaluate_on_test_set(test_file, model, rel_tot, threshold=5.0, batch_size=10
     heads = []
     tails = []
     
+    # ===== 新增：存储原始三元组信息 =====
+    original_triples = []
+
     for line in test_triples:
         h, t, r = line.strip().split()
         heads.append(int(h))
         tails.append(int(t))
         true_labels.append(int(r))
+        original_triples.append((int(h), int(t), int(r)))
         
     true_labels = np.array(true_labels)
     preds = []
     all_scores_list = []
     
+    # ===== 新增：存储预测详情 =====
+    prediction_details = []
+
     print("Running predictions in batches...")
     
     model.eval()
@@ -132,7 +140,9 @@ def evaluate_on_test_set(test_file, model, rel_tot, threshold=5.0, batch_size=10
         for i in tqdm(range(0, len(heads), batch_size)):
             batch_h = heads[i:i+batch_size]
             batch_t = tails[i:i+batch_size]
-            
+            batch_true_r = true_labels[i:i+batch_size]
+            batch_original = original_triples[i:i+batch_size]
+
             # 每个样本扩张 rel_tot 次
             # 例: bs=2, rel_tot=3
             # heads = [h1, h1, h1, h2, h2, h2]
@@ -162,16 +172,28 @@ def evaluate_on_test_set(test_file, model, rel_tot, threshold=5.0, batch_size=10
             scores = scores.reshape(-1, rel_tot)
             all_scores_list.append(scores)
             
-            # 按照阈值判断
-            for row in scores:
-                # 寻找除了关系 0（假设本来不是关系而是无边）以外能够匹配的最佳真实关系距离
-                # 如果只有关系 1 和 2 是训练的，那么这里我们可以忽略 `0` 号关系产生的打分
+            # ===== 记录每个样本的预测结果 =====
+            for j, row in enumerate(scores):
                 best_rel = np.argmin(row)
                 min_score = row[best_rel]
                 
-                # if min_score > threshold:
-                #     preds.append(0)
-                # else:
+                # 获取原始三元组
+                h, t, true_r = batch_original[j]
+                
+                # 计算置信度（将距离转换为置信度分数）
+                confidence = 1.0 / (1.0 + min_score)
+                
+                # 保存预测详情
+                prediction_details.append({
+                    'head': h,
+                    'tail': t,
+                    'true_relation': true_r,
+                    'pred_relation': best_rel,
+                    'min_distance': min_score,
+                    'confidence': confidence,
+                    'is_correct': (true_r == best_rel)
+                })
+                
                 preds.append(best_rel)
                     
     preds = np.array(preds)
@@ -217,10 +239,70 @@ def evaluate_on_test_set(test_file, model, rel_tot, threshold=5.0, batch_size=10
     print(f"Class 2 (Neg Edge)- Prec: {pre_label2:.4f}, Rec: {rec_label2:.4f}")
     print("=" * 40)
 
+    # ===== 保存预测结果 =====
+    if save_predictions:
+        import pandas as pd
+        from pathlib import Path
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # 创建预测结果DataFrame
+        df_predictions = pd.DataFrame(prediction_details)
+        
+        # 映射到原始ID
+        if node_file is not None:
+            df_nodes = pd.read_csv(node_file)
+            node_to_old = dict(zip(df_nodes['node_id'], df_nodes['old_index']))
+            
+            # 添加 old_index 列
+            df_predictions['head_old'] = df_predictions['head'].map(node_to_old)
+            df_predictions['tail_old'] = df_predictions['tail'].map(node_to_old)
+            
+            # 如果有节点类型信息
+            if 'node_type' in df_nodes.columns:
+                node_to_type = dict(zip(df_nodes['node_id'], df_nodes['node_type']))
+                df_predictions['head_type'] = df_predictions['head'].map(node_to_type)
+                df_predictions['tail_type'] = df_predictions['tail'].map(node_to_type)
+            
+            # 重新排列列
+            cols = ['head', 'head_old', 'tail', 'tail_old', 
+                    'true_relation', 'pred_relation', 'confidence', 'is_correct']
+            if 'head_type' in df_predictions.columns:
+                cols = ['head', 'head_old', 'head_type', 'tail', 'tail_old', 'tail_type', 
+                        'true_relation', 'pred_relation', 'confidence', 'is_correct']
+            
+            df_predictions = df_predictions[[c for c in cols if c in df_predictions.columns]]
+            
+            # 保存带原始ID的结果
+            mapped_file = output_path / "predictions_with_original_ids.csv"
+            df_predictions.to_csv(mapped_file, index=False)
+            print(f"✅ 带原始ID的预测结果已保存到: {mapped_file}")
+            
+            # 保存简洁版（只包含关键信息）
+            simple_cols = ['head_old', 'tail_old', 'pred_relation', 'confidence', 'is_correct']
+            if 'head_type' in df_predictions.columns:
+                simple_cols = ['head_old', 'head_type', 'tail_old', 'tail_type', 
+                              'pred_relation', 'confidence', 'is_correct']
+            simple_df = df_predictions[simple_cols].sort_values('confidence', ascending=False)
+            simple_file = output_path / "predictions_simple.csv"
+            simple_df.to_csv(simple_file, index=False)
+            print(f"✅ 简洁版预测结果已保存到: {simple_file}")
+        
+        else:
+            # 如果不映射，直接保存原始结果
+            raw_file = output_path / "predictions_raw.csv"
+            df_predictions.to_csv(raw_file, index=False)
+            print(f"✅ 原始预测结果已保存到: {raw_file}")
+        
+        return df_predictions
+    
+    return None
+
 if __name__ == "__main__":
-    in_path = "/mnt/e/OpenKE/benchmarks/PPI/"
-    ckpt_path = "/mnt/e/OpenKE/checkpoint/transe_PPI_UPDATE.ckpt"
-    test_file = "/mnt/e/OpenKE/benchmarks/PPI/valid2id.txt"  # 如果你没有存 test2id，你可以用 valid2id 测试
+    in_path = "./DDA_20pct/"
+    ckpt_path = "./checkpoint/DDA_20pct.ckpt"
+    test_file = "./DDA_20pct/valid2id.txt"  # 如果你没有存 test2id，你可以用 valid2id 测试
     
     # transe or rotate
     model_name = "transe" 

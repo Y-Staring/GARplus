@@ -33,4 +33,5 @@ enumeration-discovery/processed/
 
 *.py text eol=lf
 *.md text eol=lf
-*.sh text eol=lf
+*.sh text eol=lf*.log
+enumeration-discovery/online_result/

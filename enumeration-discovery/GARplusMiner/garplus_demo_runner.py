@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from pathlib import Path
 from pprint import pprint
 from typing import Callable, List, Optional
-
-from graph_types import DataGraph, FrequentPattern, PatternOptions
+import json
+import time
+from graph_types import DataGraph, FrequentPattern, GraphInstance, PatternOptions
 from garplus_ml_predicates import MLPredicateConfig, inject_ml_predicates
 from predicate_enrichment import PredicateEnrichmentConfig, enrich_numeric_bin_predicates
 from pattern_bn import PatternBayesianNetwork, PatternBNConfig
-from pattern_extension import GraphSpawn
+from pattern_extension import GraphSpawn, topology_pattern_code
+from vf3_linux import find_matches_with_limit
 from predicate_bn import PredicateBayesianNetwork, PredicateBNConfig
 from predicate_selection import DecisionTreePredicateSelector, FPGrowthPredicateSelector, Rule
 from rulegeneration import (
@@ -35,6 +39,80 @@ GraphLoader = Callable[..., object]
 SeedBuilder = Callable[[object], FrequentPattern]
 
 
+def build_undirected_rematch_graph(graph: DataGraph) -> tuple[DataGraph, dict[object, object]]:
+    """Build a temporary bidirectional graph for undirected-pattern rematching."""
+
+    rematch_graph = deepcopy(graph)
+    reverse_edge_id_map: dict[object, object] = {}
+    existing = {(edge.src, edge.dst, edge.label) for edge in rematch_graph.all_edges()}
+    for edge in list(graph.all_edges()):
+        reverse_key = (edge.dst, edge.src, edge.label)
+        if reverse_key in existing:
+            continue
+        synthetic_edge_id = ("_undirected_reverse", edge.edge_id)
+        reverse_edge_id_map[synthetic_edge_id] = edge.edge_id
+        reverse_attrs = dict(edge.attrs)
+        reverse_attrs["_undirected_reverse"] = True
+        reverse_attrs["_original_edge_id"] = edge.edge_id
+        reverse_edge = replace(
+            edge,
+            edge_id=synthetic_edge_id,
+            src=edge.dst,
+            dst=edge.src,
+            attrs=reverse_attrs,
+        )
+        rematch_graph.out_edges.setdefault(reverse_edge.src, []).append(reverse_edge)
+        rematch_graph.in_edges.setdefault(reverse_edge.dst, []).append(reverse_edge)
+        rematch_graph.edges_by_id[synthetic_edge_id] = reverse_edge
+        existing.add(reverse_key)
+    return rematch_graph, reverse_edge_id_map
+
+
+def normalize_undirected_rematch_instances(
+    instances: List[GraphInstance],
+    original_graph: DataGraph,
+    reverse_edge_id_map: dict[object, object],
+) -> List[GraphInstance]:
+    """Map synthetic reverse edges back to their original edge ids."""
+
+    normalized: List[GraphInstance] = []
+    for instance in instances:
+        edge_bindings = {
+            pattern_edge_index: reverse_edge_id_map.get(edge_id, edge_id)
+            for pattern_edge_index, edge_id in instance.edge_bindings.items()
+        }
+        edge_triplets = []
+        for edge_id in edge_bindings.values():
+            edge = original_graph.edges_by_id.get(edge_id)
+            if edge is not None:
+                edge_triplets.append((edge.src, edge.dst, edge.label))
+        normalized.append(
+            GraphInstance(
+                node_map=dict(instance.node_map),
+                edge_ids=tuple(sorted(edge_triplets)),
+                pivot=instance.pivot,
+                edge_bindings=edge_bindings,
+            )
+        )
+    return normalized
+
+
+def dedupe_rematch_instances(instances: List[GraphInstance]) -> List[GraphInstance]:
+    """Remove duplicate embeddings introduced by temporary reverse edges."""
+
+    seen = set()
+    deduped: List[GraphInstance] = []
+    for instance in instances:
+        key = (
+            tuple(sorted(instance.node_map.items())),
+            tuple(sorted(instance.edge_bindings.items(), key=lambda item: (item[0], str(item[1])))),
+        )
+        if key not in seen:
+            seen.add(key)
+            deduped.append(instance)
+    return deduped
+
+
 @dataclass
 class GarplusRunConfig:
     dataset_name: str
@@ -45,23 +123,36 @@ class GarplusRunConfig:
     node_csv_path: Optional[str] = None
     node_csv_label: str = "node_csv"
     csv_graph_loader: Optional[GraphLoader] = None
+    verification_graph_loader: Optional[GraphLoader] = None
     auto_discover_if_missing: bool = False
     fallback_interaction_name: str = "edges.csv"
     fallback_node_name: str = "node.csv"
     use_sampled_pt_graph: bool = True
     force_edge_label: Optional[str] = None
     edge_label_column: str = "Experimental System"
+    structural_edge_label_enabled: bool = False
+    structural_edge_label_attr: Optional[str] = None
     augment_negative_edges: bool = True
     negative_edge_limit: int = 2000
     balance_edge_labels: bool = True
     mode: str = "decision-tree"  # fp-growth
+    fp_growth_max_itemset_size: int = 3
     y_key: str = "e0.interaction_label"
     target_y_keys: Optional[List[str]] = None
     include_ml_predicate_targets: bool = True
+    include_edge_existing_target: bool = False
+    pattern_extension_only: bool = False
+    pattern_extension_debug: bool = False
+    pattern_extension_debug_limit: int = 500
+    global_rematch_patterns: bool = True
+    global_vspawn_instances: bool = False
+    global_match_scope: str = "sampled"
     decision_tree_max_depth: int = 3
     max_rows: int = 50
     undirected: bool = True
     undirected_pattern: bool = True
+    topology_only_pattern_dedup: bool = False
+    topology_dedupe_respect_direction: bool = False
     full_solution: bool = False
     pattern_support: int = 5
     min_support: int = 50
@@ -70,14 +161,31 @@ class GarplusRunConfig:
     max_radius: int = 4
     max_add_edge: int = 4
     node_max_add_edge: int = 4
-    max_multi_support: int = 10000
+    min_pattern_nodes: Optional[int] = None
+    max_pattern_nodes: Optional[int] = None
+    max_multi_support: Optional[int] = 10000
+    global_rematch_max_instances: Optional[int] = None
+    global_rematch_max_pattern_edges: Optional[int] = None
+    global_rematch_target_edge_index: int = 0
+    global_rematch_max_instances_per_target_edge: Optional[int] = None
+    pattern_dedup_prefer_target_value: Optional[str] = None
     print_rule_limit: int = 10
     print_deduped_rule_limit: int = 50
     deduped_rules_output_path: Optional[str] = None
+    enable_target_recall: bool = True
+    enable_rule_payload_generation: bool = True
+    save_pattern_instances: bool = True
+    max_saved_instances_per_pattern: Optional[int] = None
+    pattern_instances_output_path: Optional[str] = None
     print_full_payload: bool = False
     print_payload_snapshot: bool = False
     print_instances: bool = False
     print_instance_limit: int = 5
+    debug_literal_keys: bool = True
+    debug_literal_instance_limit: int = 1
+    debug_match_expansion: bool = True
+    debug_transaction_cost: bool = True
+    debug_sample_matches: int = 3
     print_bn_stats: bool = True
     enable_sampled_frequent_patterns: bool = True
     sampled_frequent_min_graph_support: int = 5
@@ -91,6 +199,7 @@ class GarplusRunConfig:
     drop_ignored_target_edges: bool = False
     filter_degree_predicates: bool = False
     ignored_predicate_key_tokens: tuple[str, ...] = ("degree", "high_degree")
+    drop_target_entity_features: bool = False
     enable_pattern_bn: bool = True
     tau_p: float = 0.5
     pattern_bn_top_k_per_spawn_node: Optional[int] = None
@@ -125,6 +234,215 @@ def resolve_path(raw_path: Optional[str], fallback_name: str, auto_discover: boo
         raise FileNotFoundError(f"Could not auto-discover {fallback_name}")
     matches.sort(key=lambda candidate: len(str(candidate)))
     return str(matches[0])
+
+
+
+def _pattern_instance_output_path(cfg: GarplusRunConfig) -> Path:
+    """Keep instance output next to the existing per-dataset artifacts."""
+
+    if cfg.pattern_instances_output_path:
+        return Path(cfg.pattern_instances_output_path)
+    if cfg.deduped_rules_output_path:
+        return Path(cfg.deduped_rules_output_path).with_name("pattern_instances.jsonl")
+    if cfg.sampled_pt_path:
+        return Path(cfg.sampled_pt_path).parent / "pattern_instances.jsonl"
+    return Path("processed") / cfg.dataset_name.lower() / "pattern_instances.jsonl"
+
+
+def _original_instance_node_id(graph: DataGraph, node_id: object) -> object:
+    """Return the loader's original CSV index when it is available."""
+
+    vertex = graph.vertices.get(node_id)
+    if vertex is None:
+        return node_id
+    for key in ("source_node_id", "original_index"):
+        value = vertex.attrs.get(key)
+        if value is not None:
+            return value
+    return node_id
+
+
+def _edge_for_pattern_instance(graph: DataGraph, pattern, instance: GraphInstance, edge_index: int):
+    """Resolve an edge with the same binding/fallback order as instance_literals."""
+
+    edge_id = instance.get_edge_id(edge_index)
+    edge = graph.edges_by_id.get(edge_id) if edge_id is not None else None
+    if edge is not None:
+        return edge
+    pattern_edge = pattern.edges[edge_index]
+    src = instance.node_map.get(pattern_edge.src)
+    dst = instance.node_map.get(pattern_edge.dst)
+    if src is None or dst is None:
+        return None
+    matches = graph.find_edges(src, dst, pattern_edge.label)
+    return matches[0] if matches else None
+
+
+def _instance_edge_pair(graph: DataGraph, pattern, instance: GraphInstance, edge_index: int) -> Optional[tuple[str, str]]:
+    edge = _edge_for_pattern_instance(graph, pattern, instance, edge_index)
+    if edge is not None:
+        return str(_original_instance_node_id(graph, edge.src)), str(_original_instance_node_id(graph, edge.dst))
+    if edge_index >= len(pattern.edges):
+        return None
+    pattern_edge = pattern.edges[edge_index]
+    src = instance.node_map.get(pattern_edge.src)
+    dst = instance.node_map.get(pattern_edge.dst)
+    if src is None or dst is None:
+        return None
+    return str(_original_instance_node_id(graph, src)), str(_original_instance_node_id(graph, dst))
+
+
+def print_global_rematch_debug(
+    cfg: GarplusRunConfig,
+    graph: DataGraph,
+    frequent_pattern: FrequentPattern,
+    backend: str,
+    incremental_multi: int,
+    global_single: int,
+) -> None:
+    if not cfg.debug_match_expansion:
+        return
+    pattern = frequent_pattern.pattern
+    edge_rows = [
+        (f"e{edge_index}", edge.src, edge.dst, edge.label)
+        for edge_index, edge in enumerate(pattern.edges)
+    ]
+    print(
+        "[GlobalRematchDebug] "
+        f"pattern_id={pattern.pattern_id} nodes={pattern.node_count()} edges={pattern.edge_count()} "
+        f"labels={pattern.node_labels} edge_vars={[row[0] for row in edge_rows]} "
+        f"edge_list={edge_rows} respect_direction={cfg.topology_dedupe_respect_direction} "
+        f"topology_only={cfg.topology_only_pattern_dedup} backend={backend} "
+        f"global_multi={frequent_pattern.multi_support()} global_single={global_single} "
+        f"incremental_multi={incremental_multi}"
+    )
+
+    instances = frequent_pattern.instances
+    raw_count = len(instances)
+    node_tuples = [
+        tuple(instance.node_map.get(node_index) for node_index in range(pattern.node_count()))
+        for instance in instances
+    ]
+    unique_node_tuple_count = len(set(node_tuples))
+    duplicate_ratio = 1.0 - (unique_node_tuple_count / raw_count) if raw_count else 0.0
+    print(
+        f"[GlobalRematchDup] pattern_id={pattern.pattern_id} raw={raw_count} "
+        f"unique_node_tuples={unique_node_tuple_count} duplicate_ratio={duplicate_ratio:.3f}"
+    )
+
+    edge_role_counts = {}
+    e0_counter: Counter = Counter()
+    for instance in instances:
+        for edge_index, _pattern_edge in enumerate(pattern.edges):
+            pair = _instance_edge_pair(graph, pattern, instance, edge_index)
+            if pair is None:
+                continue
+            edge_role_counts.setdefault(edge_index, set()).add(pair)
+            if edge_index == 0:
+                e0_counter[pair] += 1
+    unique_e0 = len(e0_counter)
+    avg_per_e0 = raw_count / unique_e0 if unique_e0 else 0.0
+    max_per_e0 = max(e0_counter.values()) if e0_counter else 0
+    print(
+        f"[GlobalRematchE0] pattern_id={pattern.pattern_id} raw={raw_count} "
+        f"unique_e0_pairs={unique_e0} avg_per_e0={avg_per_e0:.2f} "
+        f"max_per_e0={max_per_e0} top5={e0_counter.most_common(5)}"
+    )
+    role_summary = " ".join(
+        f"e{edge_index}_unique={len(edge_role_counts.get(edge_index, set()))}"
+        for edge_index in range(pattern.edge_count())
+    )
+    print(f"[GlobalRematchEdgeRole] pattern_id={pattern.pattern_id} {role_summary}")
+    for sample_index, instance in enumerate(instances[: max(0, cfg.debug_sample_matches)]):
+        nodes = {
+            f"v{node_index}": str(_original_instance_node_id(graph, data_node_id))
+            for node_index, data_node_id in sorted(instance.node_map.items())
+        }
+        edges = {
+            f"e{edge_index}": _instance_edge_pair(graph, pattern, instance, edge_index)
+            for edge_index in range(pattern.edge_count())
+        }
+        print(f"[GlobalRematchSample] pattern_id={pattern.pattern_id} sample={sample_index} nodes={nodes} edges={edges}")
+
+
+def save_pattern_instances(
+    dataset_name: str,
+    graph: DataGraph,
+    patterns: List[FrequentPattern],
+    output_path: Path,
+    max_instances_per_pattern: Optional[int] = None,
+) -> int:
+    """Persist existing pattern embeddings without changing matching or mining state."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with output_path.open("w", encoding="utf-8") as handle:
+        for frequent_pattern in patterns:
+            pattern = frequent_pattern.pattern
+            for match_id, instance in enumerate(frequent_pattern.instances):
+                if max_instances_per_pattern is not None and match_id >= max_instances_per_pattern:
+                    break
+                nodes = {
+                    f"v{pattern_node_id}": str(_original_instance_node_id(graph, data_node_id))
+                    for pattern_node_id, data_node_id in sorted(instance.node_map.items())
+                }
+                edges = {}
+                for edge_index, pattern_edge in enumerate(pattern.edges):
+                    edge = _edge_for_pattern_instance(graph, pattern, instance, edge_index)
+                    if edge is None:
+                        src = instance.node_map.get(pattern_edge.src)
+                        dst = instance.node_map.get(pattern_edge.dst)
+                    else:
+                        src, dst = edge.src, edge.dst
+                    src_index = _original_instance_node_id(graph, src) if src is not None else None
+                    dst_index = _original_instance_node_id(graph, dst) if dst is not None else None
+                    edges[f"e{edge_index}"] = {
+                        "src": str(src_index) if src_index is not None else None,
+                        "dst": str(dst_index) if dst_index is not None else None,
+                        "src_index": str(src_index) if src_index is not None else None,
+                        "dst_index": str(dst_index) if dst_index is not None else None,
+                    }
+                json.dump(
+                    {
+                        "dataset": dataset_name,
+                        "pattern_id": pattern.pattern_id,
+                        "match_id": match_id,
+                        "nodes": nodes,
+                        "edges": edges,
+                    },
+                    handle,
+                    ensure_ascii=False,
+                )
+                handle.write("\n")
+                written += 1
+    return written
+
+
+def print_pattern_instances_summary(graph: DataGraph, patterns: List[FrequentPattern]) -> None:
+    total_instances = 0
+    max_pattern_id = None
+    max_instances = -1
+    for frequent_pattern in patterns:
+        pattern = frequent_pattern.pattern
+        instances = frequent_pattern.instances
+        total_instances += len(instances)
+        if len(instances) > max_instances:
+            max_instances = len(instances)
+            max_pattern_id = pattern.pattern_id
+        unique_e0 = {
+            pair
+            for instance in instances
+            for pair in [_instance_edge_pair(graph, pattern, instance, 0)]
+            if pair is not None
+        }
+        print(
+            f"[PatternInstancesByPattern] pattern_id={pattern.pattern_id} "
+            f"instances={len(instances)} unique_e0={len(unique_e0)}"
+        )
+    print(
+        f"[PatternInstancesSummary] total_instances={total_instances} patterns={len(patterns)} "
+        f"max_pattern_id={max_pattern_id} max_instances={max_instances if max_instances >= 0 else 0}"
+    )
 
 
 def normalize_rule_literal_for_dedupe(item: str) -> str:
@@ -163,59 +481,71 @@ def dedupe_rules_semantically(pattern_rules):
     return rows
 
 
-def compute_rule_closures(deduped_rows) -> dict:
-    implications = []
-    for _pattern_id, _rule, key in deduped_rows:
-        antecedent_key, consequent_key = key
-        implications.append((set(antecedent_key), consequent_key))
-
-    closures = {}
-    for _pattern_id, _rule, key in deduped_rows:
-        antecedent_key, _consequent_key = key
-        closure = set(antecedent_key)
-        changed = True
-        while changed:
-            changed = False
-            for lhs, rhs in implications:
-                if lhs.issubset(closure) and rhs not in closure:
-                    closure.add(rhs)
-                    changed = True
-        closures[key] = tuple(sorted(closure))
-    return closures
+def rule_is_entailed(rule_key, other_rule_keys) -> bool:
+    antecedent_key, consequent_key = rule_key
+    closure = set(antecedent_key)
+    if consequent_key in closure:
+        return True
+    changed = True
+    while changed:
+        changed = False
+        for other_antecedent, other_consequent in other_rule_keys:
+            if set(other_antecedent).issubset(closure) and other_consequent not in closure:
+                closure.add(other_consequent)
+                changed = True
+                if consequent_key in closure:
+                    return True
+    return False
 
 
-def format_deduped_rule_row(pattern_id, rule, key, closure=None) -> str:
+def compute_rule_cover(deduped_rows):
+    """Return an irredundant rule subset equivalent under forward implication."""
+
+    cover = list(deduped_rows)
+    weakest_first = sorted(
+        deduped_rows,
+        key=lambda item: (float(item[1].confidence), float(item[1].support), float(item[1].lift)),
+    )
+    for candidate in weakest_first:
+        if candidate not in cover:
+            continue
+        candidate_key = candidate[2]
+        other_keys = [row[2] for row in cover if row is not candidate]
+        if rule_is_entailed(candidate_key, other_keys):
+            cover.remove(candidate)
+    cover.sort(key=lambda item: (float(item[1].confidence), float(item[1].support), float(item[1].lift)), reverse=True)
+    return cover
+
+
+def format_deduped_rule_row(pattern_id, rule, key) -> str:
     antecedent_key, consequent_key = key
-    closure_text = f" closure={closure}" if closure is not None else ""
     return (
-        "  deduped_rule "
+        "  cover_rule "
         f"pattern_id={pattern_id} antecedent={antecedent_key} consequent={consequent_key} "
         f"raw_antecedent={rule.antecedent} raw_consequent={rule.consequent} "
         f"support={int(rule.support)} confidence={rule.confidence:.3f} lift={rule.lift:.3f}"
-        f"{closure_text}"
     )
 
 
-def _print_deduped_rule_row(pattern_id, rule, key, closure=None) -> None:
-    print(format_deduped_rule_row(pattern_id, rule, key, closure=closure))
+def _print_deduped_rule_row(pattern_id, rule, key) -> None:
+    print(format_deduped_rule_row(pattern_id, rule, key))
 
 
-def write_deduped_rules(path: str, deduped_rows, closures=None) -> None:
+def write_deduped_rules(path: str, deduped_rows) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
         for pattern_id, rule, key in deduped_rows:
-            closure = closures.get(key) if closures else None
-            handle.write(format_deduped_rule_row(pattern_id, rule, key, closure=closure).strip() + "\n")
+            handle.write(format_deduped_rule_row(pattern_id, rule, key).strip() + "\n")
 
 
 def print_deduped_rules(pattern_rules, limit: int, output_path: Optional[str] = None):
     deduped = dedupe_rules_semantically(pattern_rules)
-    closures = compute_rule_closures(deduped)
+    cover = compute_rule_cover(deduped)
     grouped = {"positive": [], "negative": [], "other": []}
-    for row in deduped:
+    for row in cover:
         _pattern_id, rule, _key = row
-        value = _rule_consequent_value(rule)
+        value = _rule_consequent_class(rule)
         if value == "positive":
             grouped["positive"].append(row)
         elif value == "negative":
@@ -224,18 +554,19 @@ def print_deduped_rules(pattern_rules, limit: int, output_path: Optional[str] = 
             grouped["other"].append(row)
 
     print(
-        f"[DedupedRules] raw={len(pattern_rules)} unique={len(deduped)} limit_per_group={limit} "
+        f"[RuleCover] raw={len(pattern_rules)} deduped={len(deduped)} cover={len(cover)} "
+        f"redundant_removed={len(deduped) - len(cover)} limit_per_group={limit} "
         f"positive={len(grouped['positive'])} negative={len(grouped['negative'])} other={len(grouped['other'])}"
     )
     for group_name in ("positive", "negative", "other"):
         rows = grouped[group_name]
-        print(f"[DedupedRules/{group_name}] count={len(rows)} shown={min(len(rows), limit)}")
+        print(f"[RuleCover/{group_name}] count={len(rows)} shown={min(len(rows), limit)}")
         for pattern_id, rule, key in rows[:limit]:
-            _print_deduped_rule_row(pattern_id, rule, key, closure=closures.get(key))
+            _print_deduped_rule_row(pattern_id, rule, key)
     if output_path:
-        write_deduped_rules(output_path, deduped, closures=closures)
-        print(f"[DedupedRules] wrote={len(deduped)} path={output_path}")
-    return deduped
+        write_deduped_rules(output_path, cover)
+        print(f"[RuleCover] wrote={len(cover)} path={output_path}")
+    return cover
 
 
 def rule_consequent_distribution(rules) -> dict:
@@ -250,21 +581,33 @@ def _rule_consequent_value(rule: Rule) -> str:
     return rule.consequent.split("=", 1)[1] if "=" in rule.consequent else rule.consequent
 
 
+def _rule_consequent_class(rule: Rule) -> str:
+    value = _rule_consequent_value(rule)
+    if value in {"negative", "false"}:
+        return "negative"
+    if value in {"positive", "true"}:
+        return "positive"
+    return "other"
+
+
 def discovered_rule_table_stats(deduped_rows, pattern_size_by_id: dict) -> dict:
     rules = [rule for _pattern_id, rule, _key in deduped_rows]
     total = len(rules)
-    positive = sum(1 for rule in rules if _rule_consequent_value(rule) == "positive")
-    negative = sum(1 for rule in rules if _rule_consequent_value(rule) == "negative")
+    positive = sum(1 for rule in rules if _rule_consequent_class(rule) == "positive")
+    negative = sum(1 for rule in rules if _rule_consequent_class(rule) == "negative")
     avg_conf = sum(float(rule.confidence) for rule in rules) / total if total else 0.0
+    avg_antecedent_size = sum(len(rule.antecedent) for rule in rules) / total if total else 0.0
     avg_pattern_size = (
         sum(float(pattern_size_by_id.get(pattern_id, 0)) for pattern_id, _rule, _key in deduped_rows) / total
         if total
         else 0.0
     )
+
     return {
         "positive": positive,
         "negative": negative,
         "negative_ratio": negative / total if total else 0.0,
+        "avg_antecedent_size": avg_antecedent_size,
         "avg_pattern_size": avg_pattern_size,
         "avg_confidence": avg_conf,
         "total": total,
@@ -273,10 +616,11 @@ def discovered_rule_table_stats(deduped_rows, pattern_size_by_id: dict) -> dict:
 
 def print_discovered_rule_stats_table(dataset_name: str, stats: dict) -> None:
     print("[DiscoveredRuleStats]")
-    print("Dataset | |Sigma_p| | |Sigma_n| | Neg. Ratio | Avg. |Q| | Avg. Conf. | #Total")
+    print("Dataset | |Sigma_p| | |Sigma_n| | Neg. Ratio | Avg. |X| | Avg. |Q| | Avg. Conf. | #Total")
     print(
         f"{dataset_name} | {stats['positive']} | {stats['negative']} | "
-        f"{stats['negative_ratio']:.4f} | {stats['avg_pattern_size']:.3f} | "
+        f"{stats['negative_ratio']:.4f} | {stats['avg_antecedent_size']:.3f} | "
+        f"{stats['avg_pattern_size']:.3f} | "
         f"{stats['avg_confidence']:.3f} | {stats['total']}"
     )
 
@@ -367,6 +711,8 @@ def build_target_y_list(graph, cfg: GarplusRunConfig) -> List[str]:
     """Build Go-style yList: each item is mined as one independent RHS."""
 
     candidates = list(cfg.target_y_keys) if cfg.target_y_keys else [cfg.y_key]
+    if cfg.include_edge_existing_target:
+        candidates.append("e0.edge_existing")
     if cfg.include_ml_predicate_targets:
         edge_keys = {key for edge in graph.all_edges() for key in edge.attrs.keys()}
         for key in ("ml_equivalence_pred", "ml_similarity_pred", "ml_pred_ppi", "ml_pred_not_ppi", "ml_offline_predicate_name"):
@@ -385,6 +731,8 @@ def build_target_y_list(graph, cfg: GarplusRunConfig) -> List[str]:
 def predicate_focus_for_y_key(cfg: GarplusRunConfig, y_key: str) -> Optional[str]:
     if y_key == cfg.y_key:
         return cfg.predicate_bn_focus_target
+    if y_key.endswith("edge_existing"):
+        return f"{y_key}=false"
     if (
         y_key.endswith("ml_equivalence_pred")
         or y_key.endswith("ml_similarity_pred")
@@ -422,6 +770,12 @@ def predicate_bn_cache_for_y_key(cfg: GarplusRunConfig, y_key: str, focus_item: 
     if focus_item is not None:
         safe_key = f"{safe_key}_{focus_cache_suffix(focus_item)}"
     return str(path.with_name(f"{path.stem}_{safe_key}{path.suffix}"))
+
+
+def allowed_consequent_values_for_y_key(y_key: str) -> Optional[set[str]]:
+    if y_key.endswith("edge_existing"):
+        return {"false"}
+    return None
 
 
 def drop_edges_by_target_values(
@@ -465,7 +819,12 @@ def print_rule_consequent_distribution(rules: List[Rule]) -> None:
 
 def print_target_rule_diagnostics(selector, target_value: str, limit: int = 20) -> None:
     method_name = f"{target_value}_diagnostics"
-    diagnostics = getattr(selector, method_name)(limit=limit) if hasattr(selector, method_name) else []
+    if hasattr(selector, method_name):
+        diagnostics = getattr(selector, method_name)(limit=limit)
+    elif hasattr(selector, "target_value_diagnostics"):
+        diagnostics = selector.target_value_diagnostics(target_value, limit=limit)
+    else:
+        diagnostics = []
     if not diagnostics:
         print(f"[PredicateSelection] {target_value}_candidate_diagnostics=[]")
         return
@@ -481,7 +840,43 @@ def print_target_rule_diagnostics(selector, target_value: str, limit: int = 20) 
 
 def print_rule_candidate_diagnostics(selector, limit: int = 20) -> None:
     print_target_rule_diagnostics(selector, "negative", limit=limit)
+    print_target_rule_diagnostics(selector, "false", limit=limit)
     print_target_rule_diagnostics(selector, "positive", limit=limit)
+
+
+def print_target_row_diagnostics(selector, focus_item: Optional[str] = None) -> None:
+    summary = getattr(selector, "target_stage_summary", None) or {}
+    if not summary:
+        return
+    print(
+        "[TargetRows] "
+        f"y_key={summary.get('y_key')} raw_rows={summary.get('raw_rows')} "
+        f"raw_counts={summary.get('raw_counts')} "
+        f"after_value_rows={summary.get('after_value_rows')} "
+        f"after_value_counts={summary.get('after_value_counts')} "
+        f"missing_target_after_value_pruning={summary.get('missing_target_after_value_pruning')} "
+        f"ignored_counts={summary.get('ignored_counts')} "
+        f"after_ignored_rows={summary.get('after_ignored_rows')} "
+        f"after_ignored_counts={summary.get('after_ignored_counts')}"
+    )
+    if not focus_item or "=" not in focus_item:
+        return
+    _focus_key, focus_value = focus_item.split("=", 1)
+    raw_count = int(summary.get("raw_counts", {}).get(focus_value, 0))
+    after_value_count = int(summary.get("after_value_counts", {}).get(focus_value, 0))
+    after_ignored_count = int(summary.get("after_ignored_counts", {}).get(focus_value, 0))
+    if raw_count == 0:
+        reason = "no_matched_instances_with_target_value"
+    elif after_value_count == 0:
+        reason = "target_value_removed_by_min_value_support"
+    elif after_ignored_count == 0:
+        reason = "target_value_removed_by_ignored_target_values"
+    else:
+        reason = "target_value_available_for_itemset_mining"
+    print(
+        f"[TargetFocusAvailability] focus={focus_item} raw={raw_count} "
+        f"after_value={after_value_count} after_ignored={after_ignored_count} reason={reason}"
+    )
 
 
 def print_negative_rule_diagnostics(selector, limit: int = 20) -> None:
@@ -606,6 +1001,8 @@ def load_graph(cfg: GarplusRunConfig, interaction_csv_path: str, node_csv_path: 
             protein_index_column="index",
             edge_label_column=cfg.edge_label_column,
             force_edge_label=cfg.force_edge_label,
+            structural_edge_label_enabled=cfg.structural_edge_label_enabled,
+            structural_edge_label_attr=cfg.structural_edge_label_attr,
             augment_negative_edges=cfg.augment_negative_edges,
             negative_edge_limit=cfg.negative_edge_limit,
             interaction_label_column="interaction_label",
@@ -619,6 +1016,27 @@ def load_graph(cfg: GarplusRunConfig, interaction_csv_path: str, node_csv_path: 
         undirected=cfg.undirected,
         protein_path=node_csv_path,
         protein_index_column="index",
+        edge_label_column=cfg.edge_label_column,
+        force_edge_label=cfg.force_edge_label,
+        structural_edge_label_enabled=cfg.structural_edge_label_enabled,
+        structural_edge_label_attr=cfg.structural_edge_label_attr,
+    )
+
+
+def load_verification_graph(cfg: GarplusRunConfig, interaction_csv_path: str, node_csv_path: Optional[str]):
+    loader = cfg.verification_graph_loader or cfg.csv_graph_loader
+    if loader is None:
+        raise ValueError("global rematch requires verification_graph_loader or csv_graph_loader")
+    return loader(
+        interaction_csv_path,
+        max_rows=None,
+        undirected=cfg.undirected,
+        protein_path=node_csv_path,
+        protein_index_column="index",
+        edge_label_column=cfg.edge_label_column,
+        force_edge_label=cfg.force_edge_label,
+        structural_edge_label_enabled=cfg.structural_edge_label_enabled,
+        structural_edge_label_attr=cfg.structural_edge_label_attr,
     )
 
 
@@ -634,13 +1052,28 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     print(f"[Input] interaction_csv={interaction_csv_path}")
     print(f"[Input] {cfg.node_csv_label}={node_csv_path}")
     print(f"[Config] dataset={cfg.dataset_name} mode={cfg.mode} max_rows={cfg.max_rows} y_key={cfg.y_key} min_value_support_count={cfg.min_value_support_count}")
+    print(
+        f"[StructuralEdgeLabel] enabled={cfg.structural_edge_label_enabled} "
+        f"base={cfg.force_edge_label or cfg.edge_label_column} attr={cfg.structural_edge_label_attr}"
+    )
     print(f"[Pruning] tau_p={cfg.tau_p} tau_x={cfg.tau_x} predicate_focus={cfg.predicate_bn_focus_target}")
     print(
         f"[PatternConfig] support={cfg.pattern_support} max_radius={cfg.max_radius} "
         f"max_add_edge={cfg.max_add_edge} node_max_add_edge={cfg.node_max_add_edge} "
+        f"min_pattern_nodes={cfg.min_pattern_nodes} max_pattern_nodes={cfg.max_pattern_nodes} "
         f"pattern_top_k={cfg.pattern_bn_top_k_per_spawn_node} pattern_min_keep={cfg.pattern_bn_min_keep_per_spawn_node}"
     )
     print(f"[BN] pattern_bn={cfg.enable_pattern_bn} predicate_bn={cfg.enable_predicate_bn}")
+    print(
+        f"[PatternDebug] only={cfg.pattern_extension_only} enabled={cfg.pattern_extension_debug} "
+        f"event_limit={cfg.pattern_extension_debug_limit}"
+    )
+    print(
+        f"[PatternMatching] global_rematch_patterns={cfg.global_rematch_patterns} "
+        f"global_vspawn_instances={cfg.global_vspawn_instances} "
+        f"global_rematch_max_instances={cfg.global_rematch_max_instances} "
+        f"global_match_scope={cfg.global_match_scope}"
+    )
     print(f"[Targets] include_ml_predicate_targets={cfg.include_ml_predicate_targets}")
     print(f"[PatternMode] undirected_pattern={cfg.undirected_pattern}")
 
@@ -648,19 +1081,23 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     if cfg.drop_ignored_target_edges:
         drop_summary = drop_edges_by_target_values(graph, cfg.ignored_target_values)
         print(f"[TargetEdgeFilter] {drop_summary}")
-    ml_summary = inject_ml_predicates(graph, cfg.dataset_name, cfg.ml_predicates)
-    if ml_summary.get("enabled"):
-        print(f"[MLPredicate] {ml_summary}")
-    enrichment_summary = enrich_numeric_bin_predicates(graph, cfg.predicate_enrichment)
-    if enrichment_summary.get("enabled"):
-        print(f"[PredicateEnrichment] {enrichment_summary}")
-    target_y_list = build_target_y_list(graph, cfg)
-    print(f"[YList] targets={target_y_list}")
+    target_y_list = []
+    if not cfg.pattern_extension_only:
+        ml_summary = inject_ml_predicates(graph, cfg.dataset_name, cfg.ml_predicates)
+        if ml_summary.get("enabled"):
+            print(f"[MLPredicate] {ml_summary}")
+        enrichment_summary = enrich_numeric_bin_predicates(graph, cfg.predicate_enrichment)
+        if enrichment_summary.get("enabled"):
+            print(f"[PredicateEnrichment] {enrichment_summary}")
+        target_y_list = build_target_y_list(graph, cfg)
+        print(f"[YList] targets={target_y_list}")
     isolated_vertices = sum(1 for node_id in graph.vertices if not graph.out_edges.get(node_id) and not graph.in_edges.get(node_id))
     print(
         f"[Graph] vertices={len(graph.vertices)} out_edge_lists={sum(len(v) for v in graph.out_edges.values())} "
         f"isolated_vertices={isolated_vertices}"
     )
+    edge_label_counts = Counter(str(edge.label) for edge in graph.all_edges())
+    print(f"[GraphEdgeLabels] unique={len(edge_label_counts)} top={edge_label_counts.most_common(20)}")
     print_interaction_label_distribution(graph)
 
     frequent_sampled = []
@@ -709,8 +1146,15 @@ def run_demo(cfg: GarplusRunConfig) -> None:
             max_radius=cfg.max_radius,
             max_add_edge=cfg.max_add_edge,
             node_max_add_edge=cfg.node_max_add_edge,
+            max_pattern_nodes=cfg.max_pattern_nodes,
             full_solution=cfg.full_solution,
             max_multi_support=cfg.max_multi_support,
+            undirected_pattern=cfg.undirected_pattern,
+            topology_only_dedup=cfg.topology_only_pattern_dedup,
+            topology_dedupe_respect_direction=cfg.topology_dedupe_respect_direction,
+            global_vspawn_instances=cfg.global_vspawn_instances,
+            extension_debug=cfg.pattern_extension_debug,
+            extension_debug_limit=cfg.pattern_extension_debug_limit,
         ),
         pattern_bn=pattern_bn,
     )
@@ -751,25 +1195,164 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     if not generated:
         raise RuntimeError("No pattern generated. Try lowering pattern_support or increasing max_radius/max_add_edge.")
 
+    if cfg.global_rematch_patterns:
+        # VSpawn may use capped parent embeddings for fast structural exploration.
+        # Rebuild every candidate's instances globally before rule mining.
+        rematch_limit = cfg.global_rematch_max_instances
+        if cfg.global_match_scope == "sampled":
+            rematch_graph = graph
+        elif cfg.global_match_scope == "original":
+            rematch_graph = load_verification_graph(cfg, interaction_csv_path, node_csv_path)
+            if cfg.drop_ignored_target_edges:
+                print(f"[VerificationTargetEdgeFilter] {drop_edges_by_target_values(rematch_graph, cfg.ignored_target_values)}")
+            ml_summary = inject_ml_predicates(rematch_graph, cfg.dataset_name, cfg.ml_predicates)
+            if ml_summary.get("enabled"):
+                print(f"[VerificationMLPredicate] {ml_summary}")
+            enrichment_summary = enrich_numeric_bin_predicates(rematch_graph, cfg.predicate_enrichment)
+            if enrichment_summary.get("enabled"):
+                print(f"[VerificationPredicateEnrichment] {enrichment_summary}")
+        else:
+            raise ValueError(f"Unsupported global_match_scope: {cfg.global_match_scope}")
+        reverse_edge_id_map = {}
+        print(
+            f"[GlobalRematchGraph] mode={cfg.global_match_scope} vertices={len(rematch_graph.vertices)} "
+            f"edges={len(rematch_graph.edges_by_id)}"
+        )
+        globally_matched = []
+        for item in generated:
+            previous_multi_support = item.multi_support()
+            if (
+                cfg.global_rematch_max_pattern_edges is not None
+                and item.pattern.edge_count() > cfg.global_rematch_max_pattern_edges
+            ):
+                globally_matched.append(item)
+                print(
+                    f"[GlobalRematch] pattern_id={item.pattern.pattern_id} kept=True "
+                    f"backend=incremental "
+                    f"incremental_multi={previous_multi_support} global_multi={item.multi_support()} "
+                    f"global_single={item.single_support()} "
+                    f"reason=skip_global_rematch_edges>{cfg.global_rematch_max_pattern_edges}"
+                )
+                continue
+            matches = find_matches_with_limit(
+                item.pattern,
+                rematch_graph,
+                rematch_limit,
+                target_edge_index=cfg.global_rematch_target_edge_index,
+                max_instances_per_target_edge=cfg.global_rematch_max_instances_per_target_edge,
+                target_edge_undirected=cfg.undirected_pattern,
+            )
+            match_backend = "vf3_linux"
+            if reverse_edge_id_map:
+                matches = normalize_undirected_rematch_instances(matches, graph, reverse_edge_id_map)
+                matches = dedupe_rematch_instances(matches)
+            single_support = len({match.pivot for match in matches if match.pivot is not None}) or len(matches)
+            if single_support < cfg.pattern_support:
+                print(
+                    f"[GlobalRematch] pattern_id={item.pattern.pattern_id} kept=False "
+                    f"backend={match_backend} "
+                    f"incremental_multi={previous_multi_support} global_multi={len(matches)} "
+                    f"global_single={single_support} reason=support<{cfg.pattern_support}"
+                )
+                continue
+            rematched = FrequentPattern(
+                pattern=item.pattern,
+                instances=matches,
+                sampled=not cfg.full_solution,
+                total_single_support=single_support,
+                total_multi_support=len(matches),
+            )
+            globally_matched.append(rematched)
+            print(
+                f"[GlobalRematch] pattern_id={item.pattern.pattern_id} kept=True "
+                f"backend={match_backend} "
+                f"incremental_multi={previous_multi_support} global_multi={len(matches)} "
+                f"global_single={single_support}"
+            )
+            print_global_rematch_debug(
+                cfg,
+                rematch_graph,
+                rematched,
+                match_backend,
+                previous_multi_support,
+                single_support,
+            )
+        generated = globally_matched
+        graph = rematch_graph
+        if not generated:
+            raise RuntimeError("No globally matched pattern passed pattern_support.")
+
+    def pattern_representative_rank(item):
+        if not cfg.pattern_dedup_prefer_target_value:
+            return item.single_support(), item.multi_support()
+        preferred_count = 0
+        for instance in item.instances:
+            edge_id = instance.get_edge_id(0)
+            edge = graph.edges_by_id.get(edge_id) if edge_id is not None else None
+            if edge is not None and str(edge.attrs.get("interaction_label")) == cfg.pattern_dedup_prefer_target_value:
+                preferred_count += 1
+        return preferred_count, item.single_support(), item.multi_support()
+
     unique_patterns = {}
     for item in generated:
-        key = item.pattern.undirected_canonical_code() if cfg.undirected_pattern else item.pattern.canonical_code()
+        if cfg.topology_only_pattern_dedup:
+            key = topology_pattern_code(item.pattern, cfg.topology_dedupe_respect_direction)
+        else:
+            key = item.pattern.undirected_canonical_code() if cfg.undirected_pattern else item.pattern.canonical_code()
         current = unique_patterns.get(key)
-        if current is None or (item.single_support(), item.multi_support()) > (current.single_support(), current.multi_support()):
+        if current is None or pattern_representative_rank(item) > pattern_representative_rank(current):
             unique_patterns[key] = item
+    size_filtered_patterns = [
+        item
+        for item in unique_patterns.values()
+        if (cfg.min_pattern_nodes is None or item.pattern.node_count() >= cfg.min_pattern_nodes)
+        and (cfg.max_pattern_nodes is None or item.pattern.node_count() <= cfg.max_pattern_nodes)
+    ]
+    size_filtered_out = len(unique_patterns) - len(size_filtered_patterns)
     patterns_to_mine = sorted(
-        unique_patterns.values(),
+        size_filtered_patterns,
         key=lambda item: (item.pattern.edge_count(), item.single_support(), item.multi_support()),
         reverse=True,
     )
     print(
-        f"[Patterns] generated_total={len(generated)} unique_total={len(patterns_to_mine)} "
-        f"deduped={len(generated) - len(patterns_to_mine)} undirected={cfg.undirected_pattern}"
+        f"[Patterns] generated_total={len(generated)} unique_total={len(unique_patterns)} "
+        f"mining_total={len(patterns_to_mine)} "
+        f"deduped={len(generated) - len(unique_patterns)} size_filtered={size_filtered_out} "
+        f"min_pattern_nodes={cfg.min_pattern_nodes} max_pattern_nodes={cfg.max_pattern_nodes} "
+        f"undirected={cfg.undirected_pattern} "
+        f"topology_only={cfg.topology_only_pattern_dedup} "
+        f"respect_direction={cfg.topology_dedupe_respect_direction}"
     )
+    saved_pattern_instances = 0
+    pattern_instances_path = None
+    if cfg.save_pattern_instances:
+        pattern_instances_path = _pattern_instance_output_path(cfg)
+        saved_pattern_instances = save_pattern_instances(
+            cfg.dataset_name,
+            graph,
+            patterns_to_mine,
+            pattern_instances_path,
+            cfg.max_saved_instances_per_pattern,
+        )
+        print(f"[PatternInstances] wrote={saved_pattern_instances} path={pattern_instances_path}")
+        if cfg.debug_match_expansion:
+            print_pattern_instances_summary(graph, patterns_to_mine)
+    if cfg.pattern_extension_only:
+        print(f"\n=== Pattern Extension Results dataset={cfg.dataset_name} ===")
+        for index, item in enumerate(patterns_to_mine, start=1):
+            edges = [(edge.src, edge.dst, edge.label) for edge in item.pattern.edges]
+            print(
+                f"[PatternExtension/Result] index={index}/{len(patterns_to_mine)} "
+                f"pattern_id={item.pattern.pattern_id} nodes={item.pattern.node_labels} edges={edges} "
+                f"radius={item.pattern.radius} single={item.single_support()} multi={item.multi_support()}"
+            )
+        print_bn_summary(pattern_bn, None, cfg)
+        return
 
     total_sent = 0
     all_pattern_rules = []
     pattern_size_by_id = {}
+    rule_mining_started = time.perf_counter()
     for pattern_index, target_pattern in enumerate(patterns_to_mine, start=1):
         edges = [(edge.src, edge.dst, edge.label) for edge in target_pattern.pattern.edges]
         print(
@@ -826,8 +1409,14 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         min_value_support_count=cfg.min_value_support_count,
                         predicate_bn=predicate_bn,
                         drop_target_values=set(cfg.ignored_target_values) if cfg.drop_unknown_target_rows else None,
+                        allowed_consequent_values=allowed_consequent_values_for_y_key(y_key),
                         drop_feature_key_tokens=cfg.ignored_predicate_key_tokens if cfg.filter_degree_predicates else None,
+                        drop_target_entity_features=cfg.drop_target_entity_features,
                         max_depth=cfg.decision_tree_max_depth,
+                        debug_literal_keys=cfg.debug_literal_keys,
+                        debug_literal_instance_limit=cfg.debug_literal_instance_limit,
+                        debug_transaction_cost=cfg.debug_transaction_cost,
+                        predicate_focus_item=focus_item,
                     )
                     focus_rules = selector.generate_rules(graph, target_pattern, y_key)
                     print(
@@ -841,7 +1430,14 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         min_value_support_count=cfg.min_value_support_count,
                         predicate_bn=predicate_bn,
                         drop_target_values=set(cfg.ignored_target_values) if cfg.drop_unknown_target_rows else None,
+                        allowed_consequent_values=allowed_consequent_values_for_y_key(y_key),
                         drop_feature_key_tokens=cfg.ignored_predicate_key_tokens if cfg.filter_degree_predicates else None,
+                        drop_target_entity_features=cfg.drop_target_entity_features,
+                        debug_literal_keys=cfg.debug_literal_keys,
+                        debug_literal_instance_limit=cfg.debug_literal_instance_limit,
+                        debug_transaction_cost=cfg.debug_transaction_cost,
+                        predicate_focus_item=focus_item,
+                        max_itemset_size=cfg.fp_growth_max_itemset_size,
                     )
                     focus_rules = selector.generate_rules(graph, target_pattern, y_key)
                     print(
@@ -858,6 +1454,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         f"focus={focus_item} tokens={cfg.ignored_predicate_key_tokens} dropped_keys={len(dropped_keys)} "
                         f"sample={dropped_keys[:20]}"
                     )
+                print_target_row_diagnostics(selector, focus_item)
                 print_rule_consequent_distribution(focus_rules)
                 print_rule_candidate_diagnostics(selector)
                 focus_results.append((focus_item, selector, focus_rules))
@@ -880,28 +1477,37 @@ def run_demo(cfg: GarplusRunConfig) -> None:
             print_rule_consequent_distribution(rules)
             if y_key.endswith("interaction_label"):
                 recall_negative_value = "negative"
+            elif y_key.endswith("edge_existing"):
+                recall_negative_value = "false"
             elif y_key.endswith("ml_offline_predicate_name"):
                 recall_negative_value = "ml_pred_not_ppi"
             else:
                 recall_negative_value = "no"
-            target_recall = evaluate_negative_rule_recall(
-                active_selector,
-                graph,
-                target_pattern,
-                rules,
-                y_key,
-                negative_value=recall_negative_value,
-            )
-            print(
-                "[TargetRecall] "
-                f"pattern_id={target_pattern.pattern.pattern_id} y_key={y_key} "
-                f"target_value={recall_negative_value} "
-                f"target_rules={target_recall['negative_rules']} "
-                f"covered_edges={target_recall['covered_negative_edges']}/{target_recall['total_negative_edges']} "
-                f"edge_recall={target_recall['edge_recall']:.4f} "
-                f"covered_instances={target_recall['covered_negative_instances']}/{target_recall['negative_instances']} "
-                f"instance_recall={target_recall['instance_recall']:.4f}"
-            )
+            if cfg.enable_target_recall:
+                target_recall = evaluate_negative_rule_recall(
+                    active_selector,
+                    graph,
+                    target_pattern,
+                    rules,
+                    y_key,
+                    negative_value=recall_negative_value,
+                )
+                print(
+                    "[TargetRecall] "
+                    f"pattern_id={target_pattern.pattern.pattern_id} y_key={y_key} "
+                    f"target_value={recall_negative_value} "
+                    f"target_rules={target_recall['negative_rules']} "
+                    f"covered_edges={target_recall['covered_negative_edges']}/{target_recall['total_negative_edges']} "
+                    f"edge_recall={target_recall['edge_recall']:.4f} "
+                    f"covered_instances={target_recall['covered_negative_instances']}/{target_recall['negative_instances']} "
+                    f"instance_recall={target_recall['instance_recall']:.4f}"
+                )
+            else:
+                print(
+                    "[TargetRecall] "
+                    f"pattern_id={target_pattern.pattern.pattern_id} y_key={y_key} "
+                    "skipped because enable_target_recall=False"
+                )
             for rule in rules[: cfg.print_rule_limit]:
                 print(
                     f"  antecedent={rule.antecedent} consequent={rule.consequent} "
@@ -912,6 +1518,14 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                 print(
                     f"[RuleGeneration] pattern_id={target_pattern.pattern.pattern_id} "
                     f"y_key={y_key} skipped because no predicate rules were generated"
+                )
+                continue
+
+            if not cfg.enable_rule_payload_generation:
+                print(
+                    f"[RuleGeneration] pattern_id={target_pattern.pattern.pattern_id} "
+                    f"y_key={y_key} skipped payload generation because "
+                    "enable_rule_payload_generation=False"
                 )
                 continue
 
@@ -935,6 +1549,12 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                     pprint(snapshot)
                 else:
                     pprint(trim_instances(snapshot, cfg))
+    rule_mining_seconds = time.perf_counter() - rule_mining_started
+    print(
+        f"[Timing] stage=rule_mining_total algorithm=GARplus dataset={cfg.dataset_name} "
+        f"patterns={len(patterns_to_mine)} raw_rules={len(all_pattern_rules)} "
+        f"seconds={rule_mining_seconds:.6f}"
+    )
     print(f"\n=== BN Summary dataset={cfg.dataset_name} ===")
     print_bn_summary(pattern_bn, None, cfg)
     for bn_key, predicate_bn in predicate_bns.items():
@@ -957,8 +1577,10 @@ def run_demo(cfg: GarplusRunConfig) -> None:
         f"raw_rules={len(all_pattern_rules)} deduped_rules={len(deduped_rows)} "
         f"positive_rules={table_stats['positive']} negative_rules={table_stats['negative']} "
         f"negative_ratio={table_stats['negative_ratio']:.4f} "
+        f"avg_antecedent_size={table_stats['avg_antecedent_size']:.3f} "
         f"avg_pattern_size={table_stats['avg_pattern_size']:.3f} "
         f"avg_confidence={table_stats['avg_confidence']:.3f} "
         f"raw_consequents={raw_rule_distribution} deduped_consequents={deduped_rule_distribution} "
-        f"total_sent={total_sent}"
+        f"total_sent={total_sent} pattern_instances={saved_pattern_instances} "
+        f"pattern_instances_path={pattern_instances_path}"
     )

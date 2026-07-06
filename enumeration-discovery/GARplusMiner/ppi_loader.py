@@ -17,6 +17,7 @@ from collections import Counter
 from typing import Dict, Optional
 
 from graph_types import DataGraph, FrequentPattern, GraphInstance, GraphPattern, Vertex
+from structural_edge_label import structural_edge_label
 
 
 def _normalize_key(raw: str) -> str:
@@ -170,7 +171,7 @@ def _assign_degree_features(graph: DataGraph) -> None:
         vertex.attrs["high_degree"] = "yes" if bucket == "high" else "no"
 
 
-def load_ppi_csv(path: str, max_rows: Optional[int] = None, undirected: bool = True, edge_label_column: str = "Experimental System", protein_path: Optional[str] = None, protein_index_column: str = "index") -> DataGraph:
+def load_ppi_csv(path: str, max_rows: Optional[int] = None, undirected: bool = True, edge_label_column: str = "Experimental System", protein_path: Optional[str] = None, protein_index_column: str = "index", force_edge_label: Optional[str] = None, structural_edge_label_enabled: bool = False, structural_edge_label_attr: Optional[str] = None) -> DataGraph:
     """Load the interaction CSV and optionally enrich existing vertices from `protein.csv`."""
 
     vertices: Dict[int, Vertex] = {}
@@ -190,8 +191,14 @@ def load_ppi_csv(path: str, max_rows: Optional[int] = None, undirected: bool = T
                 _merge_vertex(vertices[right.id], right)
             else:
                 vertices[right.id] = right
-            edge_label = _normalize_edge_label(row.get(edge_label_column, ""))
             edge_attrs = _edge_attrs_from_row(row)
+            base_edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, ""))
+            edge_label = structural_edge_label(
+                base_edge_label,
+                edge_attrs,
+                enabled=structural_edge_label_enabled,
+                attr_key=structural_edge_label_attr,
+            )
             graph.add_edge(left.id, right.id, edge_label, edge_attrs)
             if undirected and left.id != right.id:
                 reverse_attrs = dict(edge_attrs)
