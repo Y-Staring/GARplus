@@ -24,6 +24,7 @@ while True:
 MISSING_LABELS = {"", "unknown", "candidate", "unlabeled", "none", "nan", "na", "n/a"}
 NEUTRAL_LABELS = {"neutral", "netural"}
 MISSING_VALUES = MISSING_LABELS | {"-", "null", "inf", "-inf"}
+EXPORT_LABELS = {"positive", "negative"}
 
 
 # =========================
@@ -48,7 +49,7 @@ ONLY_LABELS = MISSING_LABELS | NEUTRAL_LABELS
 OVERWRITE_EXISTING = False
 ALLOW_POSITIVE_RELABEL = False
 ALLOW_EXISTING_NEGATIVE_RELABEL = False
-EXPANSION_MODE = "anchored_existing_edge_labeling"  # "anchored_existing_edge_labeling", "existing_edge_labeling", "matched_existing", "candidate_non_edges", or "body_rematch_non_edges"
+EXPANSION_MODE = "candidate_non_edges"  # "anchored_existing_edge_labeling", "existing_edge_labeling", "matched_existing", "candidate_non_edges", or "body_rematch_non_edges"
 MAX_CANDIDATES_PER_ANCHOR = 50
 MAX_NEW_NEG_PER_NODE = 100
 MAX_NEW_NEG_TOTAL = None
@@ -94,6 +95,10 @@ class NegativeExpansionRule:
 
     @property
     def negative_label(self) -> str:
+        return self.predicted_label
+
+    @property
+    def predicted_label(self) -> str:
         if "=" not in self.consequent:
             return "negative"
         return self.consequent.split("=", 1)[1].strip()
@@ -159,7 +164,7 @@ DATASET_CONFIGS = {
         input_csv=DATA_DIR / "drug_disease_signed.csv",
         output_csv=PROCESSED_DIR / "dda" / "rule_negative_pairs_existing_edge_labeling.csv" 
         if (EXPANSION_MODE == "anchored_existing_edge_labeling") 
-        else PROCESSED_DIR / "dda" / "rule_negative_pairs_0626.csv",
+        else PROCESSED_DIR / "dda" / "rule_positive_negative_pairs_0707.csv",
         rules_file=PROCESSED_DIR / "dda" / "deduped_rules.txt",
         pattern_instances_file=PROCESSED_DIR / "dda" / "pattern_instances.jsonl",
         source_node_csv=DATA_DIR / "drug.csv",
@@ -173,7 +178,7 @@ DATASET_CONFIGS = {
         input_csv=DATA_DIR / "gene_disease_signed.csv",
         output_csv=PROCESSED_DIR / "ti" / "rule_negative_pairs_existing_edge_labeling.csv" 
         if (EXPANSION_MODE == "anchored_existing_edge_labeling") 
-        else PROCESSED_DIR / "ti" / "rule_negative_pairs_0626.csv",
+        else PROCESSED_DIR / "ti" / "rule_positive_negative_pairs_0707.csv",
 
         rules_file=PROCESSED_DIR / "ti" / "deduped_rules.txt",
         pattern_instances_file=PROCESSED_DIR / "ti" / "pattern_instances.jsonl",
@@ -431,6 +436,20 @@ def _node_id_from_instance_value(value: object) -> str:
     return _value_from_mapping(value, ("index", "node_index", "id", "node_id", "src_index", "dst_index"))
 
 
+def _replace_instance_node_id(value: object, node_id: str) -> object:
+    if not isinstance(value, dict):
+        return node_id
+    updated = dict(value)
+    replaced = False
+    for key in ("index", "node_index", "id", "node_id", "src_index", "dst_index"):
+        if key in updated:
+            updated[key] = node_id
+            replaced = True
+    if not replaced:
+        updated["index"] = node_id
+    return updated
+
+
 def _edge_endpoint(edge_info: dict, endpoint: str) -> str:
     if endpoint == "src":
         return _value_from_mapping(edge_info, ("src_index", "src_id", "src", "source", "from"))
@@ -634,9 +653,14 @@ def pattern_context_from_instance(
         attrs.setdefault("dst_index", dst)
         context[edge_var] = attrs
 
-    for node_var, node_id in instance.get("nodes", {}).items():
-        node_index = normalize_value(node_id)
-        context[node_var] = {"index": node_index, "node_index": node_index}
+    for node_var, node_value in instance.get("nodes", {}).items():
+        node_index = _node_id_from_instance_value(node_value)
+        attrs: dict[str, str] = {}
+        attrs.update((source_node_attrs or {}).get(node_index, {}))
+        attrs.update((target_node_attrs or {}).get(node_index, {}))
+        attrs["index"] = node_index
+        attrs["node_index"] = node_index
+        context[node_var] = attrs
     return context
 
 
@@ -735,12 +759,20 @@ def make_synthetic_instance_from_anchor(
 
     synthetic = deepcopy(anchor_instance)
     target_edge = synthetic.setdefault("edges", {}).setdefault(target_edge_var, {})
+    old_src = normalize_value(target_edge.get("src_index") or target_edge.get("src"))
+    old_dst = normalize_value(target_edge.get("dst_index") or target_edge.get("dst"))
     target_edge.update({
         "src": new_src,
         "dst": new_dst,
         "src_index": new_src,
         "dst_index": new_dst,
     })
+    for node_var, node_value in list(synthetic.get("nodes", {}).items()):
+        node_id = _node_id_from_instance_value(node_value)
+        if node_id == old_src:
+            synthetic["nodes"][node_var] = _replace_instance_node_id(node_value, new_src)
+        elif node_id == old_dst:
+            synthetic["nodes"][node_var] = _replace_instance_node_id(node_value, new_dst)
     synthetic["is_synthetic"] = True
     synthetic["anchor_match_id"] = anchor_instance.get("match_id", "")
     synthetic["candidate_source"] = "replace_e0_endpoint"
@@ -748,7 +780,7 @@ def make_synthetic_instance_from_anchor(
 
 
 def is_rule_allowed_for_new_edge(rule: NegativeExpansionRule, require_pair_or_context: bool = True) -> bool:
-    if consequent_target_edge(rule) != "e0" or rule.negative_label != "negative":
+    if consequent_target_edge(rule) != "e0" or rule.predicted_label not in EXPORT_LABELS:
         return False
     antecedent = rule.antecedent
     if not antecedent:
@@ -892,7 +924,7 @@ def rule_usable_for_existing_edge_labeling(rule: NegativeExpansionRule) -> bool:
 
 
 def rule_usable_for_anchored_existing_edge_labeling(rule: NegativeExpansionRule) -> bool:
-    if rule.negative_label != "negative":
+    if rule.predicted_label not in EXPORT_LABELS:
         return False
     if consequent_target_edge(rule) != "e0":
         return False
@@ -1343,7 +1375,7 @@ def expand_candidate_non_edges(
     allowed_rules_by_pattern: dict[int, list[tuple[int, NegativeExpansionRule]]] = {}
     skipped_rule_not_allowed = 0
     for rule_index, rule in enumerate(rules):
-        if rule.negative_label != config.negative_value or not is_rule_allowed_for_new_edge(
+        if not is_rule_allowed_for_new_edge(
             rule, config.require_rule_has_pair_or_context
         ):
             skipped_rule_not_allowed += 1
@@ -1358,6 +1390,7 @@ def expand_candidate_non_edges(
     skipped_node_limit = 0
     seen_pairs: set[tuple[str, str]] = set()
     node_new_counts: Counter[str] = Counter()
+    exported_label_counts: Counter[str] = Counter()
     output_rows: list[dict[str, str]] = []
 
     for pattern_id, anchor_instance, new_src, new_dst in generate_candidate_non_edges_from_instances(
@@ -1408,7 +1441,11 @@ def expand_candidate_non_edges(
                 {
                     config.src_column: new_src,
                     config.dst_column: new_dst,
-                    "predicted_label": config.negative_value,
+                    "predicted_label": rule.predicted_label,
+                    "rule_pattern_id": str(rule.pattern_id),
+                    "rule_index": str(rule_index),
+                    "rule_consequent": rule.consequent,
+                    "rule_antecedent": " & ".join(rule.antecedent),
                     "negative_rule_pattern_id": str(rule.pattern_id),
                     "negative_rule_index": str(rule_index),
                     "anchor_match_id": str(anchor_instance.get("match_id", "")),
@@ -1418,6 +1455,7 @@ def expand_candidate_non_edges(
                 }
             )
             exported_new_pairs += 1
+            exported_label_counts[rule.predicted_label] += 1
             break
 
     config.output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -1428,6 +1466,10 @@ def expand_candidate_non_edges(
                 config.src_column,
                 config.dst_column,
                 "predicted_label",
+                "rule_pattern_id",
+                "rule_index",
+                "rule_consequent",
+                "rule_antecedent",
                 "negative_rule_pattern_id",
                 "negative_rule_index",
                 "anchor_match_id",
@@ -1451,6 +1493,7 @@ def expand_candidate_non_edges(
         "skipped_existing_pair": skipped_existing_pair,
         "skipped_rule_not_allowed": skipped_rule_not_allowed,
         "skipped_node_limit": skipped_node_limit,
+        "exported_labels": ",".join(f"{label}:{count}" for label, count in exported_label_counts.most_common()),
     }
 
 
@@ -1736,11 +1779,16 @@ def expand_existing_edges_as_negative_anchored(config: ExpansionConfig) -> dict[
     input_seen_pairs: set[tuple[str, str]] = set()
     rule_match_counts: Counter[int] = Counter()
     label_counts: Counter[str] = Counter()
+    exported_label_counts: Counter[str] = Counter()
     anchored_stats: Counter[str] = Counter()
     output_fieldnames = [
         config.src_column,
         config.dst_column,
         "predicted_label",
+        "rule_pattern_id",
+        "rule_index",
+        "rule_consequent",
+        "rule_antecedent",
         "negative_rule_pattern_id",
         "negative_rule_index",
         "matched_rule_count",
@@ -1881,7 +1929,11 @@ def expand_existing_edges_as_negative_anchored(config: ExpansionConfig) -> dict[
             output_writer.writerow({
                 config.src_column: src,
                 config.dst_column: dst,
-                "predicted_label": config.negative_value,
+                "predicted_label": first_rule.predicted_label,
+                "rule_pattern_id": str(first_rule.pattern_id),
+                "rule_index": str(first_rule_index),
+                "rule_consequent": first_rule.consequent,
+                "rule_antecedent": " & ".join(first_rule.antecedent),
                 "negative_rule_pattern_id": str(first_rule.pattern_id),
                 "negative_rule_index": str(first_rule_index),
                 "matched_rule_count": str(len(matched_rules)),
@@ -1890,6 +1942,7 @@ def expand_existing_edges_as_negative_anchored(config: ExpansionConfig) -> dict[
                 "negative_rule_antecedent": " & ".join(first_rule.antecedent),
             })
             exported_rows += 1
+            exported_label_counts[first_rule.predicted_label] += 1
             pending_flush_exports += 1
             if config.incremental_write_output and pending_flush_exports >= max(1, config.flush_every_exports):
                 output_handle.flush()
@@ -1945,6 +1998,7 @@ def expand_existing_edges_as_negative_anchored(config: ExpansionConfig) -> dict[
         "anchored_partial_match_cutoffs": anchored_stats.get("anchored_partial_match_cutoffs", 0),
         "top_rule_matches": ",".join(f"{rule_index}:{count}" for rule_index, count in rule_match_counts.most_common(10)),
         "observed_labels": ",".join(f"{label or '<empty>'}:{count}" for label, count in label_counts.most_common(12)),
+        "exported_labels": ",".join(f"{label}:{count}" for label, count in exported_label_counts.most_common()),
         "elapsed_seconds": f"{time.perf_counter() - total_start:.2f}",
     }
 
@@ -2112,6 +2166,8 @@ def expand_negative_edges(config: ExpansionConfig) -> dict[str, int]:
         raise ValueError(f"unsupported expansion_mode: {config.expansion_mode}")
     instances_by_pattern = load_pattern_instances(config.pattern_instances_file)
     edge_attr_index = build_edge_attr_index(rows, config.src_column, config.dst_column, config.dataset_name)
+    source_node_attrs = load_node_attrs(str(config.source_node_csv) if config.source_node_csv else None, config.source_node_index_column)
+    target_node_attrs = load_node_attrs(str(config.target_node_csv) if config.target_node_csv else None, config.target_node_index_column)
     allowed_existing = set(config.only_labels or MISSING_LABELS)
 
     matched = 0
@@ -2123,7 +2179,13 @@ def expand_negative_edges(config: ExpansionConfig) -> dict[str, int]:
         if rule.negative_label != config.negative_value:
             continue
         for instance in instances_by_pattern.get(rule.pattern_id, []):
-            context = pattern_context_from_instance(instance, edge_attr_index)
+            context = pattern_context_from_instance(
+                instance,
+                edge_attr_index,
+                source_node_attrs,
+                target_node_attrs,
+                config.dataset_name,
+            )
             if not rule_matches(rule, context):
                 continue
             matched += 1
@@ -2201,3 +2263,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

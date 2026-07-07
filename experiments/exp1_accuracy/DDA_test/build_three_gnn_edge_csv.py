@@ -18,8 +18,10 @@ from typing import Iterable
 # Edit these paths/settings.
 # =========================
 LLM_EDGE_PATH = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/DDA_test/data_signed/edges_labeled_with_reason.csv"
-GAR_NEG_EDGE_PATH = "/home/yyyy/codework/GARplus/enumeration-discovery/processed/dda/rule_negative_pairs_0626.csv"
-OUTPUT_DIR = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/DDA_test/data_signed"
+# GAR_NEG_EDGE_PATH = "/home/yyyy/codework/GARplus/enumeration-discovery/processed/dda/rule_negative_pairs_0626.csv"
+# OUTPUT_DIR = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/DDA_test/data_signed"
+GAR_NEG_EDGE_PATH = "/home/yyyy/codework/GARplus/enumeration-discovery/processed/dda/rule_negative_pairs_existing_edge_labeling.csv"
+OUTPUT_DIR = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/DDA_test/data_signed_anchormode_all"
 
 NODE_CSV_PATH = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/DDA_test/data_signed/node_labeled.csv"
 NODE_ID_COL = "node_id"  # e.g. node_id, index, original_index, or source_node_id
@@ -54,6 +56,7 @@ GAR_DST_COL = None
 
 DIRECTED = False
 RANDOM_SEED = 42
+NEGATIVE_SAMPLING_STRATEGY = "all"  # "source_stratified", "random", or "all"
 
 
 @dataclass(frozen=True)
@@ -299,6 +302,81 @@ def sample_edges(edges: Iterable[Edge], count: int, rng: random.Random, descript
     return rng.sample(pool, count)
 
 
+def sample_edges_source_stratified(
+    edges: Iterable[Edge],
+    count: int,
+    rng: random.Random,
+    description: str,
+) -> list[Edge]:
+    """Sample negatives while preserving each source node's edge-count profile."""
+
+    pool = list(edges)
+    if len(pool) < count:
+        raise ValueError(f"Cannot sample {count} {description} edges from a pool of {len(pool)}")
+    if len(pool) == count:
+        return list(pool)
+
+    groups: dict[str, list[Edge]] = {}
+    for edge in pool:
+        groups.setdefault(edge.src, []).append(edge)
+
+    total = len(pool)
+    quotas: dict[str, int] = {}
+    remainders: list[tuple[float, int, str]] = []
+    for src, group in groups.items():
+        exact = count * len(group) / total
+        quota = min(len(group), int(exact))
+        quotas[src] = quota
+        remainders.append((exact - quota, len(group), src))
+
+    remaining = count - sum(quotas.values())
+    capacity_order = sorted(remainders, key=lambda item: (-item[0], -item[1], item[2]))
+    while remaining > 0:
+        changed = False
+        for _fraction, _size, src in capacity_order:
+            if quotas[src] >= len(groups[src]):
+                continue
+            quotas[src] += 1
+            remaining -= 1
+            changed = True
+            if remaining == 0:
+                break
+        if not changed:
+            raise RuntimeError(f"Could not allocate {count} source-stratified samples for {description}")
+
+    sampled: list[Edge] = []
+    for src, group in groups.items():
+        quota = quotas[src]
+        if quota <= 0:
+            continue
+        sampled.extend(group if quota == len(group) else rng.sample(group, quota))
+    if len(sampled) != count:
+        raise AssertionError(f"{description} source-stratified sample size mismatch: {len(sampled)} != {count}")
+    rng.shuffle(sampled)
+    return sampled
+
+
+def sample_negative_edges(
+    edges: Iterable[Edge],
+    count: int,
+    rng: random.Random,
+    description: str,
+) -> list[Edge]:
+    if NEGATIVE_SAMPLING_STRATEGY == "random":
+        return sample_edges(edges, count, rng, description)
+    if NEGATIVE_SAMPLING_STRATEGY == "source_stratified":
+        return sample_edges_source_stratified(edges, count, rng, description)
+    raise ValueError(f"Unsupported NEGATIVE_SAMPLING_STRATEGY: {NEGATIVE_SAMPLING_STRATEGY!r}")
+
+
+def source_distribution_summary(edges: Iterable[Edge], top_k: int = 8) -> str:
+    counts: dict[str, int] = {}
+    for edge in edges:
+        counts[edge.src] = counts.get(edge.src, 0) + 1
+    top_items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:top_k]
+    return ",".join(f"{src}:{count}" for src, count in top_items)
+
+
 def possible_pair_count(node_count: int) -> int:
     return node_count * (node_count - 1) if DIRECTED else node_count * (node_count - 1) // 2
 
@@ -483,8 +561,9 @@ def main() -> None:
     print(f"[Clean] LLM negatives conflict removed = {len(llm_conflicts)}")
     print(f"[Clean] GAR negatives conflict removed = {len(gar_conflicts)}")
 
-    n_negative = min(len(llm_negative_by_key), len(gar_negative_by_key))
-    if not positive_by_key or n_negative == 0:
+    matched_negative_count = min(len(llm_negative_by_key), len(gar_negative_by_key))
+    use_all_negative_edges = NEGATIVE_SAMPLING_STRATEGY == "all"
+    if not positive_by_key or matched_negative_count == 0:
         empty = []
         if not positive_by_key:
             empty.append("LLM positive")
@@ -496,9 +575,23 @@ def main() -> None:
 
     rng = random.Random(RANDOM_SEED)
     shared_positive = list(positive_by_key.values())
-    sampled_llm_negative = sample_edges(llm_negative_by_key.values(), n_negative, rng, "LLM negative")
-    sampled_gar_negative = sample_edges(gar_negative_by_key.values(), n_negative, rng, "GAR negative")
-    print(f"[Build] shared positives = {len(shared_positive)}, negatives per setting = {n_negative}")
+    if use_all_negative_edges:
+        sampled_llm_negative = list(llm_negative_by_key.values())
+        sampled_gar_negative = list(gar_negative_by_key.values())
+        baseline_negative_count_target = max(len(sampled_llm_negative), len(sampled_gar_negative))
+    else:
+        sampled_llm_negative = sample_negative_edges(llm_negative_by_key.values(), matched_negative_count, rng, "LLM negative")
+        sampled_gar_negative = sample_negative_edges(gar_negative_by_key.values(), matched_negative_count, rng, "GAR negative")
+        baseline_negative_count_target = matched_negative_count
+    print(
+        f"[Build] shared positives = {len(shared_positive)}, "
+        f"LLM negatives = {len(sampled_llm_negative)}, "
+        f"GAR negatives = {len(sampled_gar_negative)}, "
+        f"baseline negatives = {baseline_negative_count_target}, "
+        f"negative_sampling={NEGATIVE_SAMPLING_STRATEGY}"
+    )
+    print(f"[Sample] LLM negative src top = {source_distribution_summary(sampled_llm_negative)}")
+    print(f"[Sample] GAR negative src top = {source_distribution_summary(sampled_gar_negative)}")
 
     all_nodes = [str(node_id) for node_id in range(num_nodes)]
     if num_nodes < 2:
@@ -507,7 +600,7 @@ def main() -> None:
     forbidden = all_observed | {edge_key(edge) for edge in shared_positive} | {
         edge_key(edge) for edge in sampled_llm_negative
     } | {edge_key(edge) for edge in sampled_gar_negative}
-    baseline_negative = sample_pseudo_negative_edges(all_nodes, forbidden, n_negative, rng)
+    baseline_negative = sample_pseudo_negative_edges(all_nodes, forbidden, baseline_negative_count_target, rng)
 
     baseline_rows = labeled_rows(shared_positive, baseline_negative)
     llm_rows = labeled_rows(shared_positive, sampled_llm_negative)
@@ -517,7 +610,8 @@ def main() -> None:
     gar_positive, gar_negative_count = validate_output_rows(gar_rows, "gar_augmented_edges.csv")
     if not (baseline_positive == llm_positive == gar_positive):
         raise AssertionError("The three outputs do not share exactly the same positive edge set.")
-    if len({baseline_negative_count, llm_negative_count, gar_negative_count}) != 1:
+    same_negative_count = len({baseline_negative_count, llm_negative_count, gar_negative_count}) == 1
+    if not use_all_negative_edges and not same_negative_count:
         raise AssertionError("The three outputs do not contain the same number of negative edges.")
     assert_valid_node_ids(baseline_rows, num_nodes, "baseline_edges.csv")
     assert_valid_node_ids(llm_rows, num_nodes, "llm_augmented_edges.csv")
@@ -547,14 +641,19 @@ def main() -> None:
         "num_llm_negative_conflict_with_positive_removed": len(llm_conflicts),
         "num_gar_negative_conflict_with_positive_removed": len(gar_conflicts),
         "n_shared": len(shared_positive),
-        "n_negative_per_setting": n_negative,
+        "n_negative_per_setting": matched_negative_count if not use_all_negative_edges else None,
+        "matched_negative_count": matched_negative_count,
+        "baseline_negative_count_target": baseline_negative_count_target,
         "baseline": {"positive": len(shared_positive), "negative": len(baseline_negative)},
         "llm_augmented": {"positive": len(shared_positive), "negative": len(sampled_llm_negative)},
         "gar_augmented": {"positive": len(shared_positive), "negative": len(sampled_gar_negative)},
         "same_positive_across_three_settings": True,
-        "same_negative_count_across_three_settings": True,
+        "same_negative_count_across_three_settings": same_negative_count,
         "directed": DIRECTED,
         "random_seed": RANDOM_SEED,
+        "negative_sampling_strategy": NEGATIVE_SAMPLING_STRATEGY,
+        "sampled_llm_negative_src_top": source_distribution_summary(sampled_llm_negative),
+        "sampled_gar_negative_src_top": source_distribution_summary(sampled_gar_negative),
         "num_nodes": num_nodes,
         "llm_node_id_column": llm_node_id_column,
         "gar_node_id_column": gar_node_id_column,

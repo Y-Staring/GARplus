@@ -179,9 +179,9 @@ def _load_interaction_lookup(path: Optional[str], edge_label_column: str = "Expe
             right = _interaction_node_id(row, "B")
             if left is None or right is None:
                 continue
-            edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, "sampled_interaction"))
             edge_attrs = _edge_attrs_from_row(row)
             edge_attrs["source_row_id"] = row_index
+            edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, "sampled_interaction"))
             lookup[(left, right)] = (edge_label, edge_attrs)
             lookup.setdefault((right, left), (edge_label, dict(edge_attrs, direction_role="reverse_lookup")))
     return lookup
@@ -295,9 +295,9 @@ def _append_negative_edges(
         next_node_id += 2
         _ensure_augmented_vertex(vertices, left, protein_attrs, src_node, augmented_graph_id)
         _ensure_augmented_vertex(vertices, right, protein_attrs, dst_node, augmented_graph_id)
-        edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, "negative_interaction"))
         edge_attrs = dict(attrs)
         edge_attrs.setdefault(label_column, negative_value)
+        edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, "negative_interaction"))
         edge_attrs.setdefault("sampled_graph_id", augmented_graph_id)
         edge_attrs.setdefault("augmented_negative_edge", "yes")
         edge_attrs.setdefault("sampled_src_original_id", left)

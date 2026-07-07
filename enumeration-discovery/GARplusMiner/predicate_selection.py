@@ -11,6 +11,7 @@ For one fixed frequent pattern we:
 
 from collections import Counter
 from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Dict, List, Tuple, Optional, Any, Callable
 
 from graph_types import DataGraph, FrequentPattern, instance_literals
@@ -596,6 +597,7 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
         debug_literal_instance_limit: int = 1,
         debug_transaction_cost: bool = False,
         predicate_focus_item: Optional[str] = None,
+        max_itemset_size: int = 3,
     ) -> None:
         super().__init__(
             min_value_support_count=min_value_support_count,
@@ -611,6 +613,7 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
         self.min_support = min_support
         self.min_confidence = min_confidence
         self.predicate_bn = predicate_bn
+        self.max_itemset_size = max(2, int(max_itemset_size))
 
     def get_transaction_list(self, graph: DataGraph, frequent_pattern: FrequentPattern) -> List[List[str]]:
         """Convert one pattern's matched instances into transactions."""
@@ -632,21 +635,31 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
             return {}
         self.print_frequent_itemsets_cost(transactions)
         threshold = self.min_support_count(len(transactions))
-        counts: Counter = Counter()
+        counts: Counter[Tuple[str, ...]] = Counter()
         for transaction in transactions:
             for item in transaction:
                 counts[(item,)] += 1
         frequent = {items: count for items, count in counts.items() if count >= threshold}
-        pairs: Counter = Counter()
-        triples: Counter = Counter()
-        for transaction in transactions:
-            for i in range(len(transaction)):
-                for j in range(i + 1, len(transaction)):
-                    pairs[(transaction[i], transaction[j])] += 1
-                    for k in range(j + 1, len(transaction)):
-                        triples[(transaction[i], transaction[j], transaction[k])] += 1
-        frequent.update({items: count for items, count in pairs.items() if count >= threshold})
-        frequent.update({items: count for items, count in triples.items() if count >= threshold})
+        previous_frequent = set(frequent)
+        frequent_single_items = {items[0] for items in previous_frequent}
+        if not previous_frequent:
+            return frequent
+
+        for size in range(2, self.max_itemset_size + 1):
+            itemset_counts: Counter[Tuple[str, ...]] = Counter()
+            for transaction in transactions:
+                candidate_items = [item for item in transaction if item in frequent_single_items]
+                if len(candidate_items) < size:
+                    continue
+                for itemset in combinations(candidate_items, size):
+                    if size > 2 and any(tuple(subset) not in previous_frequent for subset in combinations(itemset, size - 1)):
+                        continue
+                    itemset_counts[itemset] += 1
+            current_frequent = {items: count for items, count in itemset_counts.items() if count >= threshold}
+            if not current_frequent:
+                break
+            frequent.update(current_frequent)
+            previous_frequent = set(current_frequent)
         return frequent
 
     def generate_rules(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_prefix: str) -> List[Rule]:

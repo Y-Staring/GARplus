@@ -184,7 +184,7 @@ def _append_negative_edges(
     cfg: RelationGraphConfig,
     edge_csv_path: str,
     force_edge_label: Optional[str],
-    limit: int,
+    limit: int = 0,
 ) -> int:
     if limit <= 0:
         return 0

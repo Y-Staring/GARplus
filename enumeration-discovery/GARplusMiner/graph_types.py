@@ -273,6 +273,7 @@ class PatternOptions:
     pattern_support_threshold: int = 3
     max_add_edge: int = 4
     max_radius: int = 1
+    max_pattern_nodes: Optional[int] = None
     insipid_edge_limit: int = 1
     node_max_add_edge: int = 2
     full_solution: bool = True

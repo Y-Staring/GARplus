@@ -1,5 +1,30 @@
 # GAR Python Port
 
+## 2026-06 GARplusMiner Architecture Sync
+
+This baseline now reuses the GARplusMiner VSpawn architecture while keeping GAR
+semantics:
+
+- Synchronized from `GARplusMiner`:
+  - `graph_types.py`: topology-aware canonical codes, undirected-pattern
+    options, global-vspawn flags, extension debug flags, and edge binding
+    helpers.
+  - `pattern_extension.py`: round-frontier VSpawn, topology-only dedupe,
+    optional global parent rematching, incremental instance extension after
+    adding one edge, richer `SpawnStats`, and the Go-aligned radius edge-count
+    constraint.
+  - `ppi_demo.py`: the same VSpawn knobs are exposed and VSpawn now runs
+    round-by-round until `max_radius`.
+- Kept different from `GARplusMiner`:
+  - GAR does not mine rules over synthetic or missing negative edges.
+  - GAR keeps the reduced GAR predicate space: positive edge predicates,
+    attribute existence, `x.A = y.B`, `x.A = c`, and positive ML-style
+    predicates when supplied by data/features.
+  - The GARplusMiner pattern BN and predicate BN optimizations are not wired in
+    by this baseline demo.
+  - The dependency stage remains association-rule mining (`X -> Y`) rather than
+    GAR+ negated-predicate mining.
+
 这个目录是把你刚才关心的几块 Go 代码，按“便于单机阅读和继续开发”的方式，整理成一个独立 Python 版本。
 
 ## 文件对应关系
@@ -79,10 +104,13 @@ python -m gar_python_port.demo
 ## Run on PPI CSV
 
 ```bash
-python -m gar_python_port.ppi_demo --mode pattern-only
-python -m gar_python_port.ppi_demo --mode decision-tree --max-rows 1000 --y-key v0.high_degree
-python -m gar_python_port.ppi_demo --mode fp-growth --max-rows 1000 --y-key v0.high_degree
+python ppi_demo.py
+python dda_demo.py
+python ti_demo.py
 ```
+
+Dataset-specific options live in each demo file's `CONFIG`, following the
+GARplusMiner style.
 
 Notes:
 - `protein_protein.csv` is an interaction edge table, so this loader turns every protein into a `Protein` vertex.

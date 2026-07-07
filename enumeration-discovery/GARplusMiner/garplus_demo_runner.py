@@ -7,6 +7,14 @@ from pathlib import Path
 from pprint import pprint
 from typing import Callable, List, Optional
 import json
+import sys
+import time
+
+_BN_ROOT = Path(__file__).resolve().parents[1]
+if str(_BN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BN_ROOT))
+
+from BNlearning.pattern_bn_features import augment_graph_structural_features
 from graph_types import DataGraph, FrequentPattern, GraphInstance, PatternOptions
 from garplus_ml_predicates import MLPredicateConfig, inject_ml_predicates
 from predicate_enrichment import PredicateEnrichmentConfig, enrich_numeric_bin_predicates
@@ -158,6 +166,8 @@ class GarplusRunConfig:
     max_radius: int = 4
     max_add_edge: int = 4
     node_max_add_edge: int = 4
+    min_pattern_nodes: Optional[int] = None
+    max_pattern_nodes: Optional[int] = None
     max_multi_support: Optional[int] = 10000
     global_rematch_max_instances: Optional[int] = None
     global_rematch_max_pattern_edges: Optional[int] = None
@@ -195,11 +205,14 @@ class GarplusRunConfig:
     filter_degree_predicates: bool = False
     ignored_predicate_key_tokens: tuple[str, ...] = ("degree", "high_degree")
     drop_target_entity_features: bool = False
+    augment_structural_features: bool = False
     enable_pattern_bn: bool = True
     tau_p: float = 0.5
+    pattern_bn_relative_tau: Optional[float] = None
     pattern_bn_top_k_per_spawn_node: Optional[int] = None
     pattern_bn_min_keep_per_spawn_node: int = 1
     pattern_bn_frequent_prior_weight: float = 0.25
+    pattern_bn_use_marginal_edge_score: bool = True
     pattern_bn_cache_path: Optional[str] = None
     retrain_pattern_bn: bool = True
     enable_predicate_bn: bool = True
@@ -642,10 +655,13 @@ def print_bn_summary(pattern_bn, predicate_bn, cfg: GarplusRunConfig) -> None:
             f"backend={summary.get('backend', 'unknown')} "
             f"rank_calls={summary['rank_calls']} seen={summary['candidates_seen']} "
             f"kept={summary['candidates_kept']} pruned={summary['candidates_pruned']} "
-            f"tau_p={summary.get('tau_p')} threshold_pruned={summary.get('threshold_pruned')} "
+            f"tau_p={summary.get('tau_p')} relative_tau={summary.get('relative_tau')} "
+            f"threshold_pruned={summary.get('threshold_pruned')} "
             f"topk_pruned={summary.get('topk_pruned')} min_keep_rescued={summary.get('min_keep_rescued')} "
             f"freq_priors={summary.get('frequent_edge_prior_count')} prior_weight={summary.get('frequent_prior_weight')}"
         )
+        if summary.get("bn_state_counts"):
+            print(f"  bn_states={summary.get('bn_state_counts')}")
         for score, desc in summary["top_snapshot"]:
             print(f"  pattern_bn_top score={score:.6f} candidate={desc}")
     if predicate_bn is not None:
@@ -1009,6 +1025,8 @@ def load_graph(cfg: GarplusRunConfig, interaction_csv_path: str, node_csv_path: 
         undirected=cfg.undirected,
         protein_path=node_csv_path,
         protein_index_column="index",
+        edge_label_column=cfg.edge_label_column,
+        force_edge_label=cfg.force_edge_label,
     )
 
 
@@ -1043,6 +1061,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     print(
         f"[PatternConfig] support={cfg.pattern_support} max_radius={cfg.max_radius} "
         f"max_add_edge={cfg.max_add_edge} node_max_add_edge={cfg.node_max_add_edge} "
+        f"min_pattern_nodes={cfg.min_pattern_nodes} max_pattern_nodes={cfg.max_pattern_nodes} "
         f"pattern_top_k={cfg.pattern_bn_top_k_per_spawn_node} pattern_min_keep={cfg.pattern_bn_min_keep_per_spawn_node}"
     )
     print(f"[BN] pattern_bn={cfg.enable_pattern_bn} predicate_bn={cfg.enable_predicate_bn}")
@@ -1063,6 +1082,9 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     if cfg.drop_ignored_target_edges:
         drop_summary = drop_edges_by_target_values(graph, cfg.ignored_target_values)
         print(f"[TargetEdgeFilter] {drop_summary}")
+    if cfg.augment_structural_features:
+        augment_graph_structural_features(graph)
+        print("[Graph] augmented structural features: role, clustering_bin, core_bin, score_bin")
     target_y_list = []
     if not cfg.pattern_extension_only:
         ml_summary = inject_ml_predicates(graph, cfg.dataset_name, cfg.ml_predicates)
@@ -1078,6 +1100,8 @@ def run_demo(cfg: GarplusRunConfig) -> None:
         f"[Graph] vertices={len(graph.vertices)} out_edge_lists={sum(len(v) for v in graph.out_edges.values())} "
         f"isolated_vertices={isolated_vertices}"
     )
+    edge_label_counts = Counter(str(edge.label) for edge in graph.all_edges())
+    print(f"[GraphEdgeLabels] unique={len(edge_label_counts)} top={edge_label_counts.most_common(20)}")
     print_interaction_label_distribution(graph)
 
     frequent_sampled = []
@@ -1106,9 +1130,11 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                 enabled=True,
                 top_k_per_spawn_node=cfg.pattern_bn_top_k_per_spawn_node,
                 min_score=cfg.tau_p,
+                relative_tau=cfg.pattern_bn_relative_tau,
                 min_keep_per_spawn_node=cfg.pattern_bn_min_keep_per_spawn_node,
                 frequent_edge_priors=frequent_edge_priors,
                 frequent_prior_weight=cfg.pattern_bn_frequent_prior_weight,
+                use_marginal_edge_score=cfg.pattern_bn_use_marginal_edge_score,
                 cache_path=cfg.pattern_bn_cache_path,
                 retrain=cfg.retrain_pattern_bn,
             ),
@@ -1126,6 +1152,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
             max_radius=cfg.max_radius,
             max_add_edge=cfg.max_add_edge,
             node_max_add_edge=cfg.node_max_add_edge,
+            max_pattern_nodes=cfg.max_pattern_nodes,
             full_solution=cfg.full_solution,
             max_multi_support=cfg.max_multi_support,
             undirected_pattern=cfg.undirected_pattern,
@@ -1281,14 +1308,24 @@ def run_demo(cfg: GarplusRunConfig) -> None:
         current = unique_patterns.get(key)
         if current is None or pattern_representative_rank(item) > pattern_representative_rank(current):
             unique_patterns[key] = item
+    size_filtered_patterns = [
+        item
+        for item in unique_patterns.values()
+        if (cfg.min_pattern_nodes is None or item.pattern.node_count() >= cfg.min_pattern_nodes)
+        and (cfg.max_pattern_nodes is None or item.pattern.node_count() <= cfg.max_pattern_nodes)
+    ]
+    size_filtered_out = len(unique_patterns) - len(size_filtered_patterns)
     patterns_to_mine = sorted(
-        unique_patterns.values(),
+        size_filtered_patterns,
         key=lambda item: (item.pattern.edge_count(), item.single_support(), item.multi_support()),
         reverse=True,
     )
     print(
-        f"[Patterns] generated_total={len(generated)} unique_total={len(patterns_to_mine)} "
-        f"deduped={len(generated) - len(patterns_to_mine)} undirected={cfg.undirected_pattern} "
+        f"[Patterns] generated_total={len(generated)} unique_total={len(unique_patterns)} "
+        f"mining_total={len(patterns_to_mine)} "
+        f"deduped={len(generated) - len(unique_patterns)} size_filtered={size_filtered_out} "
+        f"min_pattern_nodes={cfg.min_pattern_nodes} max_pattern_nodes={cfg.max_pattern_nodes} "
+        f"undirected={cfg.undirected_pattern} "
         f"topology_only={cfg.topology_only_pattern_dedup} "
         f"respect_direction={cfg.topology_dedupe_respect_direction}"
     )
@@ -1321,6 +1358,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     total_sent = 0
     all_pattern_rules = []
     pattern_size_by_id = {}
+    rule_mining_started = time.perf_counter()
     for pattern_index, target_pattern in enumerate(patterns_to_mine, start=1):
         edges = [(edge.src, edge.dst, edge.label) for edge in target_pattern.pattern.edges]
         print(
@@ -1385,7 +1423,6 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         debug_literal_instance_limit=cfg.debug_literal_instance_limit,
                         debug_transaction_cost=cfg.debug_transaction_cost,
                         predicate_focus_item=focus_item,
-                        max_itemset_size=cfg.fp_growth_max_itemset_size,
                     )
                     focus_rules = selector.generate_rules(graph, target_pattern, y_key)
                     print(
@@ -1406,6 +1443,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         debug_literal_instance_limit=cfg.debug_literal_instance_limit,
                         debug_transaction_cost=cfg.debug_transaction_cost,
                         predicate_focus_item=focus_item,
+                        max_itemset_size=cfg.fp_growth_max_itemset_size,
                     )
                     focus_rules = selector.generate_rules(graph, target_pattern, y_key)
                     print(
@@ -1517,6 +1555,12 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                     pprint(snapshot)
                 else:
                     pprint(trim_instances(snapshot, cfg))
+    rule_mining_seconds = time.perf_counter() - rule_mining_started
+    print(
+        f"[Timing] stage=rule_mining_total algorithm=GARplus dataset={cfg.dataset_name} "
+        f"patterns={len(patterns_to_mine)} raw_rules={len(all_pattern_rules)} "
+        f"seconds={rule_mining_seconds:.6f}"
+    )
     print(f"\n=== BN Summary dataset={cfg.dataset_name} ===")
     print_bn_summary(pattern_bn, None, cfg)
     for bn_key, predicate_bn in predicate_bns.items():

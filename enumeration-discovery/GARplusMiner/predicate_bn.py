@@ -153,15 +153,12 @@ class PredicateBayesianNetwork:
             self.trained = False
             return self
         self.model = model_cls([(feature, y_key) for feature in self.feature_columns])
-        if self.config.estimator == "maximum_likelihood":
-            self.model.fit(self.data)
-        else:
-            self.model.fit(
-                self.data,
-                estimator=estimator_cls,
-                prior_type="BDeu",
-                equivalent_sample_size=self.config.equivalent_sample_size,
-            )
+        _fit_pgmpy_model(
+            self.model,
+            self.data,
+            self.config.estimator,
+            self.config.equivalent_sample_size,
+        )
         self.trained = True
         self._save_cache_if_needed()
         return self
@@ -412,6 +409,37 @@ def _load_pgmpy(estimator: str):
             "Install them in this environment, e.g. `pip install pgmpy pandas`."
         ) from exc
     return pd, ModelCls, EstimatorCls
+
+
+def _fit_pgmpy_model(model, data, estimator: str, equivalent_sample_size: float) -> None:
+    """Use pgmpy 1.1 discrete estimators when available, otherwise fall back to pgmpy<=1.0."""
+
+    try:
+        from pgmpy.parameter_estimator import DiscreteBayesianEstimator, DiscreteMLE
+    except ModuleNotFoundError:
+        from pgmpy.estimators import BayesianEstimator, MaximumLikelihoodEstimator
+
+        if estimator == "maximum_likelihood":
+            model.fit(data, estimator=MaximumLikelihoodEstimator)
+        else:
+            model.fit(
+                data,
+                estimator=BayesianEstimator,
+                prior_type="BDeu",
+                equivalent_sample_size=equivalent_sample_size,
+            )
+        return
+
+    if estimator == "maximum_likelihood":
+        model.fit(data, estimator=DiscreteMLE())
+    else:
+        model.fit(
+            data,
+            estimator=DiscreteBayesianEstimator(
+                prior_type="BDeu",
+                equivalent_sample_size=equivalent_sample_size,
+            ),
+        )
 
 
 def _cpd_probability(model, variable: str, state: str, evidence: Dict[str, str]) -> float:

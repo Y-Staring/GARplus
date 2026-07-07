@@ -296,9 +296,21 @@ class GraphSpawner:
                     scored_edges = []
                     for edge in spawn_edges:
                         if hasattr(self.pattern_bn, "score_spawn_edge_components"):
-                            components = self.pattern_bn.score_spawn_edge_components(pattern, spawn_node, edge)
+                            components = self.pattern_bn.score_spawn_edge_components(
+                                pattern,
+                                spawn_node,
+                                edge,
+                                frequent_pattern=freq,
+                                graph=self.data_graph,
+                            )
                         else:
-                            score = self.pattern_bn.score_spawn_edge(pattern, spawn_node, edge)
+                            score = self.pattern_bn.score_spawn_edge(
+                                pattern,
+                                spawn_node,
+                                edge,
+                                frequent_pattern=freq,
+                                graph=self.data_graph,
+                            )
                             components = {
                                 "edge_prob": score,
                                 "dst_prob": 1.0,
@@ -307,7 +319,13 @@ class GraphSpawner:
                                 "final_score": score,
                             }
                         scored_edges.append((components, edge))
-                    ranked = self.pattern_bn.rank_spawn_edges(pattern, spawn_node, spawn_edges)
+                    ranked = self.pattern_bn.rank_spawn_edges(
+                        pattern,
+                        spawn_node,
+                        spawn_edges,
+                        frequent_pattern=freq,
+                        graph=self.data_graph,
+                    )
                     ranked_spawn_edges = [edge for _, edge in ranked]
                     self.stats.bn_pruned += len(spawn_edges) - len(ranked_spawn_edges)
                 else:
@@ -340,6 +358,13 @@ class GraphSpawner:
 
         grown_pattern = pattern_grow(base.pattern, spawn_edge)
         grown_pattern.refresh_radius()
+        if self.options.max_pattern_nodes is not None and grown_pattern.node_count() > self.options.max_pattern_nodes:
+            self.stats.constraint_pruned += 1
+            self._debug(
+                f"[PatternExtension/Reject] reason=max_pattern_nodes>{self.options.max_pattern_nodes} "
+                f"edge={spawn_edge} pattern={_pattern_description(grown_pattern)}"
+            )
+            return None
         if self.options.topology_only_dedup:
             code = topology_pattern_code(grown_pattern, self.options.topology_dedupe_respect_direction)
         else:

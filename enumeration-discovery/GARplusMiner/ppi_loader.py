@@ -190,8 +190,8 @@ def load_ppi_csv(path: str, max_rows: Optional[int] = None, undirected: bool = T
                 _merge_vertex(vertices[right.id], right)
             else:
                 vertices[right.id] = right
-            edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, ""))
             edge_attrs = _edge_attrs_from_row(row)
+            edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, ""))
             graph.add_edge(left.id, right.id, edge_label, edge_attrs)
             if undirected and left.id != right.id:
                 reverse_attrs = dict(edge_attrs)
