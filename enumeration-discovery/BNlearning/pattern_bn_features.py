@@ -60,6 +60,12 @@ def augment_graph_structural_features(graph: DataGraph) -> None:
     undirected = nx.Graph()
     for edge in graph.all_edges():
         undirected.add_edge(edge.src, edge.dst)
+    undirected.add_nodes_from(graph.vertices.keys())
+    self_loops = list(nx.selfloop_edges(undirected))
+    if self_loops:
+        # NetworkX core_number rejects self-loops.  Remove them only from this
+        # temporary feature graph; the original GAR graph remains unchanged.
+        undirected.remove_edges_from(self_loops)
 
     degree_map = dict(undirected.degree())
     clustering_map = nx.clustering(undirected) if undirected.number_of_edges() > 0 else {n: 0.0 for n in undirected.nodes()}

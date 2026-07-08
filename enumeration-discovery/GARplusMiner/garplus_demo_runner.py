@@ -15,7 +15,7 @@ if str(_BN_ROOT) not in sys.path:
     sys.path.insert(0, str(_BN_ROOT))
 
 from BNlearning.pattern_bn_features import augment_graph_structural_features
-from graph_types import DataGraph, FrequentPattern, GraphInstance, PatternOptions
+from graph_types import DataGraph, FrequentPattern, GraphInstance, PatternOptions, instance_literals
 from garplus_ml_predicates import MLPredicateConfig, inject_ml_predicates
 from predicate_enrichment import PredicateEnrichmentConfig, enrich_numeric_bin_predicates
 from pattern_bn import PatternBayesianNetwork, PatternBNConfig
@@ -178,6 +178,8 @@ class GarplusRunConfig:
     print_deduped_rule_limit: int = 50
     deduped_rules_output_path: Optional[str] = None
     enable_target_recall: bool = True
+    rule_coverage_scope: str = "none"  # none, sampled, original
+    rule_coverage_max_instances: Optional[int] = None
     enable_rule_payload_generation: bool = True
     save_pattern_instances: bool = True
     max_saved_instances_per_pattern: Optional[int] = None
@@ -204,6 +206,7 @@ class GarplusRunConfig:
     drop_ignored_target_edges: bool = False
     filter_degree_predicates: bool = False
     ignored_predicate_key_tokens: tuple[str, ...] = ("degree", "high_degree")
+    kept_predicate_key_tokens: tuple[str, ...] = ()
     drop_target_entity_features: bool = False
     augment_structural_features: bool = False
     enable_pattern_bn: bool = True
@@ -896,17 +899,12 @@ def print_negative_rule_diagnostics(selector, limit: int = 20) -> None:
 def _rule_matches_row(rule: Rule, row: dict) -> bool:
     for antecedent in rule.antecedent:
         key, op, value = parse_rule_literal(antecedent)
+        if key not in row:
+            return False
         row_value = str(row.get(key))
         if op == "=" and row_value != value:
             return False
         if op == "!=" and row_value == value:
-            return False
-    return True
-
-def _rule_matches_row(rule: Rule, row: dict) -> bool:
-    for antecedent in rule.antecedent:
-        key, value = antecedent.split("=", 1)
-        if str(row.get(key)) != value:
             return False
     return True
 
@@ -952,6 +950,179 @@ def evaluate_negative_rule_recall(selector, graph, frequent_pattern: FrequentPat
         "edge_recall": covered / denominator if denominator else 0.0,
         "instance_recall": covered_instances / negative_instances if negative_instances else 0.0,
     }
+
+
+def _row_from_instance(graph: DataGraph, frequent_pattern: FrequentPattern, instance: GraphInstance) -> dict[str, object]:
+    row: dict[str, object] = {}
+    for record in instance_literals(graph, frequent_pattern.pattern, instance):
+        literal_key = f"{record.entity}.{record.key}"
+        if literal_key not in row:
+            row[literal_key] = record.value
+        else:
+            existing = row[literal_key]
+            if isinstance(existing, list):
+                if record.value not in existing:
+                    existing.append(record.value)
+            elif existing != record.value:
+                row[literal_key] = [existing, record.value]
+    return {
+        key: ("|".join(str(v) for v in value) if isinstance(value, list) else value)
+        for key, value in row.items()
+    }
+
+
+def _target_edge_id(graph: DataGraph, instance: GraphInstance, target_edge_index: int) -> Optional[object]:
+    edge_id = instance.get_edge_id(target_edge_index)
+    if edge_id in graph.edges_by_id:
+        return edge_id
+    return None
+
+
+def _label_edge_sets(graph: DataGraph, y_key: str, labels: tuple[str, ...]) -> dict[str, set]:
+    entity, _, attr = y_key.partition(".")
+    if entity != "e0" or not attr:
+        return {label: set() for label in labels}
+    label_sets = {label: set() for label in labels}
+    for edge_id, edge in graph.edges_by_id.items():
+        value = str(edge.attrs.get(attr, "")).strip()
+        if value in label_sets:
+            label_sets[value].add(edge_id)
+    return label_sets
+
+
+def evaluate_global_rule_coverage(
+    graph: DataGraph,
+    frequent_patterns: List[FrequentPattern],
+    rules_by_pattern: dict[int, List[Rule]],
+    y_key: str = "e0.interaction_label",
+    labels: tuple[str, ...] = ("positive", "negative"),
+    target_edge_index: int = 0,
+) -> dict[str, object]:
+    label_edges = _label_edge_sets(graph, y_key, labels)
+    covered_edges = {label: set() for label in labels}
+    matched_instances = Counter()
+    total_instances = Counter()
+    rule_counts = {label: 0 for label in labels}
+
+    for rules in rules_by_pattern.values():
+        for rule in rules:
+            key, op, value = parse_rule_literal(rule.consequent)
+            if key == y_key and op == "=" and value in rule_counts:
+                rule_counts[value] += 1
+
+    for frequent_pattern in frequent_patterns:
+        rules = rules_by_pattern.get(frequent_pattern.pattern.pattern_id, [])
+        if not rules:
+            continue
+        rules_by_label = {label: [] for label in labels}
+        for rule in rules:
+            key, op, value = parse_rule_literal(rule.consequent)
+            if key == y_key and op == "=" and value in rules_by_label:
+                rules_by_label[value].append(rule)
+        if not any(rules_by_label.values()):
+            continue
+        for instance in frequent_pattern.instances:
+            edge_id = _target_edge_id(graph, instance, target_edge_index)
+            if edge_id is None:
+                continue
+            edge = graph.edges_by_id.get(edge_id)
+            if edge is None:
+                continue
+            label = str(edge.attrs.get(y_key.split(".", 1)[1], "")).strip()
+            if label not in rules_by_label:
+                continue
+            total_instances[label] += 1
+            if not rules_by_label[label]:
+                continue
+            row = _row_from_instance(graph, frequent_pattern, instance)
+            if y_key not in row:
+                row[y_key] = label
+            if any(_rule_matches_row(rule, row) for rule in rules_by_label[label]):
+                matched_instances[label] += 1
+                covered_edges[label].add(edge_id)
+
+    result: dict[str, object] = {}
+    total_target_edges = 0
+    total_covered_edges = 0
+    for label in labels:
+        total_edges = len(label_edges[label])
+        covered = len(covered_edges[label])
+        total_target_edges += total_edges
+        total_covered_edges += covered
+        result[f"{label}_rules"] = rule_counts[label]
+        result[f"{label}_total_edges"] = total_edges
+        result[f"{label}_covered_edges"] = covered
+        result[f"{label}_edge_recall"] = covered / total_edges if total_edges else 0.0
+        result[f"{label}_matched_instances"] = matched_instances[label]
+        result[f"{label}_total_instances"] = total_instances[label]
+        result[f"{label}_instance_recall"] = (
+            matched_instances[label] / total_instances[label] if total_instances[label] else 0.0
+        )
+    result["total_labeled_edges"] = total_target_edges
+    result["total_covered_edges"] = total_covered_edges
+    result["overall_edge_recall"] = total_covered_edges / total_target_edges if total_target_edges else 0.0
+    return result
+
+
+def rematch_patterns_for_coverage(
+    cfg: GarplusRunConfig,
+    coverage_graph: DataGraph,
+    patterns: List[FrequentPattern],
+) -> List[FrequentPattern]:
+    match_graph = coverage_graph
+    reverse_edge_id_map = {}
+    if cfg.undirected_pattern:
+        match_graph, reverse_edge_id_map = build_undirected_rematch_graph(coverage_graph)
+    rematched: List[FrequentPattern] = []
+    print(
+        f"[RuleCoverageRematch] scope={cfg.rule_coverage_scope} patterns={len(patterns)} "
+        f"vertices={len(coverage_graph.vertices)} edges={len(coverage_graph.edges_by_id)} "
+        f"max_instances={cfg.rule_coverage_max_instances}"
+    )
+    for frequent_pattern in patterns:
+        matches = find_matches_with_limit(
+            frequent_pattern.pattern,
+            match_graph,
+            cfg.rule_coverage_max_instances,
+            target_edge_index=cfg.global_rematch_target_edge_index,
+            max_instances_per_target_edge=cfg.global_rematch_max_instances_per_target_edge,
+            target_edge_undirected=cfg.undirected_pattern,
+        )
+        if reverse_edge_id_map:
+            matches = normalize_undirected_rematch_instances(matches, coverage_graph, reverse_edge_id_map)
+            matches = dedupe_rematch_instances(matches)
+        rematched.append(
+            replace(
+                frequent_pattern,
+                instances=matches,
+                total_single_support=len({tuple(sorted(instance.node_map.values())) for instance in matches}),
+                total_multi_support=len(matches),
+            )
+        )
+        print(
+            f"[RuleCoverageRematchPattern] pattern_id={frequent_pattern.pattern.pattern_id} "
+            f"instances={len(matches)}"
+        )
+    return rematched
+
+
+def prepare_original_coverage_graph(
+    cfg: GarplusRunConfig,
+    interaction_csv_path: str,
+    node_csv_path: Optional[str],
+) -> DataGraph:
+    coverage_graph = load_verification_graph(cfg, interaction_csv_path, node_csv_path)
+    if cfg.drop_ignored_target_edges:
+        print(f"[RuleCoverageTargetEdgeFilter] {drop_edges_by_target_values(coverage_graph, cfg.ignored_target_values)}")
+    if cfg.augment_structural_features:
+        augment_graph_structural_features(coverage_graph)
+    ml_summary = inject_ml_predicates(coverage_graph, cfg.dataset_name, cfg.ml_predicates)
+    if ml_summary.get("enabled"):
+        print(f"[RuleCoverageMLPredicate] {ml_summary}")
+    enrichment_summary = enrich_numeric_bin_predicates(coverage_graph, cfg.predicate_enrichment)
+    if enrichment_summary.get("enabled"):
+        print(f"[RuleCoveragePredicateEnrichment] {enrichment_summary}")
+    return coverage_graph
 
 
 
@@ -1417,6 +1588,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         drop_target_values=set(cfg.ignored_target_values) if cfg.drop_unknown_target_rows else None,
                         allowed_consequent_values=allowed_consequent_values_for_y_key(y_key),
                         drop_feature_key_tokens=cfg.ignored_predicate_key_tokens if cfg.filter_degree_predicates else None,
+                        keep_feature_key_tokens=cfg.kept_predicate_key_tokens or None,
                         drop_target_entity_features=cfg.drop_target_entity_features,
                         max_depth=cfg.decision_tree_max_depth,
                         debug_literal_keys=cfg.debug_literal_keys,
@@ -1438,6 +1610,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         drop_target_values=set(cfg.ignored_target_values) if cfg.drop_unknown_target_rows else None,
                         allowed_consequent_values=allowed_consequent_values_for_y_key(y_key),
                         drop_feature_key_tokens=cfg.ignored_predicate_key_tokens if cfg.filter_degree_predicates else None,
+                        keep_feature_key_tokens=cfg.kept_predicate_key_tokens or None,
                         drop_target_entity_features=cfg.drop_target_entity_features,
                         debug_literal_keys=cfg.debug_literal_keys,
                         debug_literal_instance_limit=cfg.debug_literal_instance_limit,
@@ -1457,7 +1630,8 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                     dropped_keys = sorted(selector.filtered_feature_keys)
                     print(
                         f"[PredicateFilter] pattern_id={target_pattern.pattern.pattern_id} y_key={y_key} "
-                        f"focus={focus_item} tokens={cfg.ignored_predicate_key_tokens} dropped_keys={len(dropped_keys)} "
+                        f"focus={focus_item} drop_tokens={cfg.ignored_predicate_key_tokens} "
+                        f"keep_tokens={cfg.kept_predicate_key_tokens} dropped_keys={len(dropped_keys)} "
                         f"sample={dropped_keys[:20]}"
                     )
                 print_target_row_diagnostics(selector, focus_item)
@@ -1576,6 +1750,44 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     raw_rule_distribution = rule_consequent_distribution([rule for _pattern_id, rule in all_pattern_rules])
     deduped_rule_distribution = rule_consequent_distribution([rule for _pattern_id, rule, _key in deduped_rows])
     table_stats = discovered_rule_table_stats(deduped_rows, pattern_size_by_id)
+    coverage_summary: dict[str, object] = {}
+    if cfg.rule_coverage_scope != "none":
+        coverage_rules_by_pattern: dict[int, List[Rule]] = {}
+        for pattern_id, rule, _key in deduped_rows:
+            coverage_rules_by_pattern.setdefault(pattern_id, []).append(rule)
+        if cfg.rule_coverage_scope == "sampled":
+            coverage_graph = graph
+            coverage_patterns = patterns_to_mine
+        elif cfg.rule_coverage_scope == "original":
+            coverage_graph = prepare_original_coverage_graph(cfg, interaction_csv_path, node_csv_path)
+            coverage_patterns = rematch_patterns_for_coverage(cfg, coverage_graph, patterns_to_mine)
+        else:
+            raise ValueError(f"Unsupported rule_coverage_scope: {cfg.rule_coverage_scope}")
+        coverage_summary = evaluate_global_rule_coverage(
+            coverage_graph,
+            coverage_patterns,
+            coverage_rules_by_pattern,
+            y_key="e0.interaction_label",
+            labels=("positive", "negative"),
+            target_edge_index=cfg.global_rematch_target_edge_index,
+        )
+        print(
+            "[RuleCoverage] "
+            f"scope={cfg.rule_coverage_scope} "
+            f"positive_rules={coverage_summary['positive_rules']} "
+            f"positive_covered_edges={coverage_summary['positive_covered_edges']}/"
+            f"{coverage_summary['positive_total_edges']} "
+            f"positive_edge_recall={coverage_summary['positive_edge_recall']:.6f} "
+            f"negative_rules={coverage_summary['negative_rules']} "
+            f"negative_covered_edges={coverage_summary['negative_covered_edges']}/"
+            f"{coverage_summary['negative_total_edges']} "
+            f"negative_edge_recall={coverage_summary['negative_edge_recall']:.6f} "
+            f"overall_covered_edges={coverage_summary['total_covered_edges']}/"
+            f"{coverage_summary['total_labeled_edges']} "
+            f"overall_edge_recall={coverage_summary['overall_edge_recall']:.6f}"
+        )
+    else:
+        print("[RuleCoverage] scope=none skipped")
     print(f"[RuleConsequentDistribution] raw={raw_rule_distribution} deduped={deduped_rule_distribution}")
     print_discovered_rule_stats_table(cfg.dataset_name, table_stats)
     print(
