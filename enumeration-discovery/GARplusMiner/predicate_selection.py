@@ -37,6 +37,7 @@ class PredicateTableMixin:
         drop_target_values: Optional[set] = None,
         allowed_consequent_values: Optional[set] = None,
         drop_feature_key_tokens: Optional[tuple[str, ...]] = None,
+        keep_feature_key_tokens: Optional[tuple[str, ...]] = None,
         drop_target_entity_features: bool = False,
         debug_literal_keys: bool = False,
         debug_literal_instance_limit: int = 1,
@@ -47,6 +48,7 @@ class PredicateTableMixin:
         self.drop_target_values = set(drop_target_values or [])
         self.allowed_consequent_values = {str(value) for value in (allowed_consequent_values or set())}
         self.drop_feature_key_tokens = tuple(token.lower() for token in (drop_feature_key_tokens or ()) if token)
+        self.keep_feature_key_tokens = tuple(token.lower() for token in (keep_feature_key_tokens or ()) if token)
         self.drop_target_entity_features = drop_target_entity_features
         self.debug_literal_keys = debug_literal_keys
         self.debug_literal_instance_limit = max(0, int(debug_literal_instance_limit))
@@ -272,15 +274,17 @@ class PredicateTableMixin:
             target_entity = y_key.split(".", 1)[0]
             if key.startswith(f"{target_entity}."):
                 return True
+        lowered = key.lower()
+        if self.keep_feature_key_tokens and not any(token in lowered for token in self.keep_feature_key_tokens):
+            return True
         if not self.drop_feature_key_tokens:
             return False
-        lowered = key.lower()
         return any(token in lowered for token in self.drop_feature_key_tokens)
 
     def filter_feature_keys(self, rows: List[Dict[str, object]], y_key: Optional[str] = None) -> List[Dict[str, object]]:
         """Remove configured shortcut/noisy feature columns from mining rows."""
 
-        if not self.drop_feature_key_tokens and not self.drop_target_entity_features:
+        if not self.drop_feature_key_tokens and not self.keep_feature_key_tokens and not self.drop_target_entity_features:
             return rows
         filtered_rows: List[Dict[str, object]] = []
         for row in rows:
@@ -379,6 +383,7 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
         drop_target_values: Optional[set] = None,
         allowed_consequent_values: Optional[set] = None,
         drop_feature_key_tokens: Optional[tuple[str, ...]] = None,
+        keep_feature_key_tokens: Optional[tuple[str, ...]] = None,
         drop_target_entity_features: bool = False,
         max_depth: int = 3,
         debug_literal_keys: bool = False,
@@ -391,6 +396,7 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
             drop_target_values=drop_target_values,
             allowed_consequent_values=allowed_consequent_values,
             drop_feature_key_tokens=drop_feature_key_tokens,
+            keep_feature_key_tokens=keep_feature_key_tokens,
             drop_target_entity_features=drop_target_entity_features,
             debug_literal_keys=debug_literal_keys,
             debug_literal_instance_limit=debug_literal_instance_limit,
@@ -592,6 +598,7 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
         drop_target_values: Optional[set] = None,
         allowed_consequent_values: Optional[set] = None,
         drop_feature_key_tokens: Optional[tuple[str, ...]] = None,
+        keep_feature_key_tokens: Optional[tuple[str, ...]] = None,
         drop_target_entity_features: bool = False,
         debug_literal_keys: bool = False,
         debug_literal_instance_limit: int = 1,
@@ -604,6 +611,7 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
             drop_target_values=drop_target_values,
             allowed_consequent_values=allowed_consequent_values,
             drop_feature_key_tokens=drop_feature_key_tokens,
+            keep_feature_key_tokens=keep_feature_key_tokens,
             drop_target_entity_features=drop_target_entity_features,
             debug_literal_keys=debug_literal_keys,
             debug_literal_instance_limit=debug_literal_instance_limit,
