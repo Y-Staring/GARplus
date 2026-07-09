@@ -38,6 +38,11 @@ TAU_P_SWEEP_RELATIVE_TAU = None
 
 RESULT_DIR = Path(__file__).resolve().parent / "tau_sensitivity_results"
 
+# Default single-run parameters. Override these from Slurm/CLI.
+ACTIVE_DATASET = "DDA"
+ACTIVE_SWEEP = "tau_p"
+ACTIVE_VALUE = 0.10
+
 # Keep runs bounded and comparable. Set to None to use each demo's original
 # max_pattern_nodes.
 MAX_PATTERN_NODES = 4
@@ -306,7 +311,29 @@ def add_relative_coverage(rows: list[dict[str, str]]) -> None:
 def main() -> None:
     global MAX_PATTERN_NODES, RULE_COVERAGE_SCOPE, RULE_COVERAGE_MAX_INSTANCES
 
-    parser = argparse.ArgumentParser(description="Run tau_P/tau_X sensitivity experiments.")
+    parser = argparse.ArgumentParser(description="Run one tau_P/tau_X sensitivity setting.")
+    parser.add_argument(
+        "--dataset",
+        default=os.environ.get("GARPLUS_TAU_DATASET", ACTIVE_DATASET),
+        choices=sorted(DATASETS),
+        help="Dataset to run. Can also be set by GARPLUS_TAU_DATASET.",
+    )
+    parser.add_argument(
+        "--sweep",
+        default=os.environ.get("GARPLUS_TAU_SWEEP", ACTIVE_SWEEP),
+        choices=("tau_p", "tau_x"),
+        help="Which threshold to vary. Can also be set by GARPLUS_TAU_SWEEP.",
+    )
+    parser.add_argument(
+        "--value",
+        default=os.environ.get("GARPLUS_TAU_VALUE", str(ACTIVE_VALUE)),
+        help="Threshold value for the selected sweep. Can also be set by GARPLUS_TAU_VALUE.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run the old full grid over all datasets and all tau values.",
+    )
     parser.add_argument(
         "--rule-coverage-scope",
         default=os.environ.get("GARPLUS_TAU_RULE_COVERAGE_SCOPE", RULE_COVERAGE_SCOPE),
@@ -332,21 +359,32 @@ def main() -> None:
     MAX_PATTERN_NODES = None if max_pattern_nodes_text in {"", "none", "null"} else int(max_pattern_nodes_text)
 
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    dataset = args.dataset
+    sweep = args.sweep
+    value = float(args.value)
     print(
         "[TauSensitivityConfig] "
+        f"dataset={dataset} sweep={sweep} value={value:g} all={args.all} "
         f"rule_coverage_scope={RULE_COVERAGE_SCOPE} "
         f"rule_coverage_max_instances={RULE_COVERAGE_MAX_INSTANCES} "
         f"max_pattern_nodes={MAX_PATTERN_NODES}"
     )
     rows: list[dict[str, str]] = []
-    for dataset, config in DATASETS.items():
-        for value in TAU_P_VALUES:
-            rows.append(run_one(dataset, config, "tau_p", value))
-        for value in TAU_X_VALUES:
-            rows.append(run_one(dataset, config, "tau_x", value))
+    if args.all:
+        for dataset_name, config in DATASETS.items():
+            for tau_value in TAU_P_VALUES:
+                rows.append(run_one(dataset_name, config, "tau_p", tau_value))
+            for tau_value in TAU_X_VALUES:
+                rows.append(run_one(dataset_name, config, "tau_x", tau_value))
+    else:
+        rows.append(run_one(dataset, DATASETS[dataset], sweep, value))
 
     add_relative_coverage(rows)
-    csv_path = RESULT_DIR / "tau_sensitivity_summary.csv"
+    if args.all:
+        csv_path = RESULT_DIR / "tau_sensitivity_summary.csv"
+    else:
+        csv_path = RESULT_DIR / dataset.lower() / sweep / f"{value:g}" / "tau_sensitivity_summary.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "dataset",
         "sweep",

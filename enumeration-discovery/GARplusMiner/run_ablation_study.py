@@ -57,6 +57,13 @@ RESULT_DIR = Path(__file__).resolve().parent / "ablation_results"
 # ACTIVE_ABLATION = "wo_neuralgar"
 ACTIVE_DATASET = "PPI"
 ACTIVE_ABLATION = "full"
+# Optional rule mining mode override.  Use None to keep each dataset demo's
+# default.  For PPI ablation with decision-tree predicates, set this to
+# "decision-tree" or pass --mode decision-tree from Slurm.
+ACTIVE_MODE = None
+# Optional decision-tree depth override.  Only matters when mode is
+# decision-tree.  Use None to keep the dataset demo's default depth.
+ACTIVE_DECISION_TREE_MAX_DEPTH = None
 
 # Keep the runner comparable and bounded. Set to None if you want each dataset's
 # original pattern-size limit.
@@ -280,7 +287,17 @@ def parse_log(log_text: str) -> dict[str, str]:
     return row
 
 
-def run_one(dataset: str, variant: str, base: GarplusRunConfig) -> dict[str, str]:
+def run_one(
+    dataset: str,
+    variant: str,
+    base: GarplusRunConfig,
+    mode_override: str | None = None,
+    decision_tree_max_depth: int | None = None,
+) -> dict[str, str]:
+    if mode_override:
+        base = replace(base, mode=mode_override)
+    if decision_tree_max_depth is not None:
+        base = replace(base, decision_tree_max_depth=decision_tree_max_depth)
     cfg = VARIANT_BUILDERS[variant](dataset, base)
     out_dir = RESULT_DIR / dataset.lower() / variant
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -307,6 +324,8 @@ def run_one(dataset: str, variant: str, base: GarplusRunConfig) -> dict[str, str
     row = {
         "dataset": dataset,
         "variant": variant,
+        "mode": cfg.mode,
+        "decision_tree_max_depth": cfg.decision_tree_max_depth,
         "status": status,
         "error": error,
         "wall_seconds": f"{wall_seconds:.6f}",
@@ -348,10 +367,30 @@ def main() -> None:
         ),
         help="Override max_pattern_nodes. Use empty string or 'none' for no override.",
     )
+    parser.add_argument(
+        "--mode",
+        default=os.environ.get(
+            "GARPLUS_ABLATION_MODE",
+            "" if ACTIVE_MODE is None else str(ACTIVE_MODE),
+        ),
+        choices=("", "none", "fp-growth", "decision-tree"),
+        help="Override GarplusRunConfig.mode. Use --mode decision-tree for PPI decision-tree ablation.",
+    )
+    parser.add_argument(
+        "--decision-tree-max-depth",
+        default=os.environ.get(
+            "GARPLUS_ABLATION_DECISION_TREE_MAX_DEPTH",
+            "" if ACTIVE_DECISION_TREE_MAX_DEPTH is None else str(ACTIVE_DECISION_TREE_MAX_DEPTH),
+        ),
+        help="Override decision_tree_max_depth. Use empty string or 'none' for the dataset default.",
+    )
     args = parser.parse_args()
 
     dataset = args.dataset
     ablation = args.ablation
+    mode_override = None if str(args.mode).strip().lower() in {"", "none"} else str(args.mode).strip()
+    depth_text = str(args.decision_tree_max_depth).strip().lower()
+    decision_tree_max_depth = None if depth_text in {"", "none", "null"} else int(depth_text)
     max_pattern_nodes_text = str(args.max_pattern_nodes).strip().lower()
     if max_pattern_nodes_text in {"", "none", "null"}:
         MAX_PATTERN_NODES = None
@@ -363,15 +402,19 @@ def main() -> None:
     print(
         "[AblationConfig] "
         f"dataset={dataset} ablation={ablation} "
-        f"max_pattern_nodes={MAX_PATTERN_NODES}"
+        f"max_pattern_nodes={MAX_PATTERN_NODES} "
+        f"mode={mode_override or DATASETS[dataset].mode} "
+        f"decision_tree_max_depth={decision_tree_max_depth or DATASETS[dataset].decision_tree_max_depth}"
     )
-    rows = [run_one(dataset, ablation, DATASETS[dataset])]
+    rows = [run_one(dataset, ablation, DATASETS[dataset], mode_override, decision_tree_max_depth)]
 
     csv_path = RESULT_DIR / dataset.lower() / ablation / "ablation_summary.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "dataset",
         "variant",
+        "mode",
+        "decision_tree_max_depth",
         "accuracy",
         "wall_seconds",
         "rule_mining_seconds",

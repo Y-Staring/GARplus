@@ -10,7 +10,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from graph_types import DataGraph, FrequentPattern, GraphInstance, GraphPattern, Vertex
 from ppi_loader import _assign_degree_features, _edge_attrs_from_row, _merge_attr, _merge_vertex, _normalize_edge_label, _normalize_key, _normalize_scalar
 from sampled_pt_loader import _balance_edges_by_label, _extract_data_and_slices, _iter_sampled_graph_records, _load_torch_object
-from structural_edge_label import structural_edge_label
 
 
 def _raise_csv_field_limit() -> None:
@@ -153,7 +152,7 @@ def _promote_edge_attrs_to_nodes(source: Vertex, target: Vertex, attrs: Dict[str
         attrs.pop(_normalize_key(column), None)
 
 
-def _load_edge_lookup(path: str, cfg: RelationGraphConfig, force_edge_label: Optional[str], structural_edge_label_enabled: bool = False, structural_edge_label_attr: Optional[str] = None) -> Dict[Tuple[int, int], Tuple[str, Dict[str, object]]]:
+def _load_edge_lookup(path: str, cfg: RelationGraphConfig, force_edge_label: Optional[str]) -> Dict[Tuple[int, int], Tuple[str, Dict[str, object]]]:
     _raise_csv_field_limit()
     lookup: Dict[Tuple[int, int], Tuple[str, Dict[str, object]]] = {}
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
@@ -168,13 +167,7 @@ def _load_edge_lookup(path: str, cfg: RelationGraphConfig, force_edge_label: Opt
             attrs = _edge_attrs_from_row(row)
             attrs.setdefault("source_row_id", row_index)
             attrs.setdefault("interaction_label", str(row.get("interaction_label", "unknown")).strip().lower() or "unknown")
-            base_edge_label = force_edge_label or _normalize_edge_label(row.get("EdgeLabel", cfg.default_edge_label))
-            edge_label = structural_edge_label(
-                base_edge_label,
-                attrs,
-                enabled=structural_edge_label_enabled,
-                attr_key=structural_edge_label_attr,
-            )
+            edge_label = force_edge_label or _normalize_edge_label(row.get("EdgeLabel", cfg.default_edge_label))
             key = (src_id, dst_id)
             chosen = _keep_stronger_signed_edge(lookup.get(key), (edge_label, attrs))
             lookup[key] = chosen
@@ -191,8 +184,6 @@ def _append_negative_edges(
     cfg: RelationGraphConfig,
     edge_csv_path: str,
     force_edge_label: Optional[str],
-    structural_edge_label_enabled: bool = False,
-    structural_edge_label_attr: Optional[str] = None,
     limit: int = 0,
 ) -> int:
     if limit <= 0:
@@ -239,15 +230,13 @@ def _append_negative_edges(
             attrs.setdefault("interaction_label", "negative")
             attrs.setdefault("sampled_src_original_id", src_orig)
             attrs.setdefault("sampled_dst_original_id", dst_orig)
+            _, src_source_id = _node_kind(src_orig, cfg)
+            _, dst_source_id = _node_kind(dst_orig, cfg)
+            attrs.setdefault("relation_src_index", src_source_id)
+            attrs.setdefault("relation_dst_index", dst_source_id)
             attrs.setdefault("augmented_negative_edge", "yes")
             _promote_edge_attrs_to_nodes(vertices[src_node], vertices[dst_node], attrs, cfg)
-            base_edge_label = force_edge_label or _normalize_edge_label(row.get("EdgeLabel", cfg.default_edge_label))
-            edge_label = structural_edge_label(
-                base_edge_label,
-                attrs,
-                enabled=structural_edge_label_enabled,
-                attr_key=structural_edge_label_attr,
-            )
+            edge_label = force_edge_label or _normalize_edge_label(row.get("EdgeLabel", cfg.default_edge_label))
             pending_edges.append((src_node, dst_node, edge_label, attrs))
             existing_pairs.add((src_orig, dst_orig))
             added += 1
@@ -267,8 +256,6 @@ def load_relation_sampled_pt_graph(
     keep_sampled_x: bool = True,
     use_original_ids_as_node_ids: bool = False,
     force_edge_label: Optional[str] = None,
-    structural_edge_label_enabled: bool = False,
-    structural_edge_label_attr: Optional[str] = None,
     augment_negative_edges: bool = False,
     negative_edge_limit: int = 0,
     interaction_label_column: str = "interaction_label",
@@ -278,13 +265,7 @@ def load_relation_sampled_pt_graph(
     obj = _load_torch_object(sampled_pt_path)
     data, slices = _extract_data_and_slices(obj)
     node_attrs = _load_relation_node_attrs(relation_config)
-    edge_lookup = _load_edge_lookup(
-        edge_csv_path,
-        relation_config,
-        force_edge_label,
-        structural_edge_label_enabled=structural_edge_label_enabled,
-        structural_edge_label_attr=structural_edge_label_attr,
-    )
+    edge_lookup = _load_edge_lookup(edge_csv_path, relation_config, force_edge_label)
 
     vertices: Dict[int, Vertex] = {}
     pending_edges: List[Tuple[int, int, str, Dict[str, object]]] = []
@@ -334,19 +315,16 @@ def load_relation_sampled_pt_graph(
                 (force_edge_label or default_edge_label or relation_config.default_edge_label, {"interaction_label": "unknown"}),
             )
             attrs = dict(edge_attrs)
-            if not edge_attrs or edge_attrs == {"interaction_label": "unknown"}:
-                edge_label = structural_edge_label(
-                    edge_label,
-                    attrs,
-                    enabled=structural_edge_label_enabled,
-                    attr_key=structural_edge_label_attr,
-                )
             attrs.setdefault("sampled_graph_id", graph_id)
             attrs.setdefault("sampled_edge_id", sampled_edge_id)
             attrs.setdefault("sampled_src_local_id", local_src)
             attrs.setdefault("sampled_dst_local_id", local_dst)
             attrs.setdefault("sampled_src_original_id", orig_src)
             attrs.setdefault("sampled_dst_original_id", orig_dst)
+            _, src_source_id = _node_kind(orig_src, relation_config)
+            _, dst_source_id = _node_kind(orig_dst, relation_config)
+            attrs.setdefault("relation_src_index", src_source_id)
+            attrs.setdefault("relation_dst_index", dst_source_id)
             attrs.setdefault(interaction_label_column, "unknown")
             _promote_edge_attrs_to_nodes(vertices[graph_src], vertices[graph_dst], attrs, relation_config)
             pending_edges.append((graph_src, graph_dst, edge_label, attrs))
@@ -360,8 +338,6 @@ def load_relation_sampled_pt_graph(
             relation_config,
             edge_csv_path,
             force_edge_label,
-            structural_edge_label_enabled,
-            structural_edge_label_attr,
             negative_edge_limit,
         )
         print(f"[SampledPT/{relation_config.relation_name}] augmented_negative_edges={added}")
@@ -386,8 +362,6 @@ def load_relation_csv_graph(
     protein_index_column: str = "index",
     edge_label_column: str = "EdgeLabel",
     force_edge_label: Optional[str] = None,
-    structural_edge_label_enabled: bool = False,
-    structural_edge_label_attr: Optional[str] = None,
 ) -> DataGraph:
     """Load the original relation CSV as the global verification graph."""
 
@@ -413,13 +387,7 @@ def load_relation_csv_graph(
             attrs.setdefault("source_row_id", row_index)
             attrs.setdefault("interaction_label", str(row.get("interaction_label", "unknown")).strip().lower() or "unknown")
             _promote_edge_attrs_to_nodes(vertices[source_id], vertices[target_id], attrs, relation_config)
-            base_edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, relation_config.default_edge_label))
-            edge_label = structural_edge_label(
-                base_edge_label,
-                attrs,
-                enabled=structural_edge_label_enabled,
-                attr_key=structural_edge_label_attr,
-            )
+            edge_label = force_edge_label or _normalize_edge_label(row.get(edge_label_column, relation_config.default_edge_label))
             graph.add_edge(source_id, target_id, edge_label, attrs)
             if undirected:
                 graph.add_edge(target_id, source_id, edge_label, dict(attrs, direction_role="reverse_copy"))
@@ -435,3 +403,8 @@ def build_source_seed_pattern(graph: DataGraph, source_label: str) -> FrequentPa
         if vertex.label == source_label
     ]
     return FrequentPattern(pattern=pattern, instances=instances)
+
+
+
+
+

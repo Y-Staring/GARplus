@@ -296,9 +296,21 @@ class GraphSpawner:
                     scored_edges = []
                     for edge in spawn_edges:
                         if hasattr(self.pattern_bn, "score_spawn_edge_components"):
-                            components = self.pattern_bn.score_spawn_edge_components(pattern, spawn_node, edge)
+                            components = self.pattern_bn.score_spawn_edge_components(
+                                pattern,
+                                spawn_node,
+                                edge,
+                                frequent_pattern=freq,
+                                graph=self.data_graph,
+                            )
                         else:
-                            score = self.pattern_bn.score_spawn_edge(pattern, spawn_node, edge)
+                            score = self.pattern_bn.score_spawn_edge(
+                                pattern,
+                                spawn_node,
+                                edge,
+                                frequent_pattern=freq,
+                                graph=self.data_graph,
+                            )
                             components = {
                                 "edge_prob": score,
                                 "dst_prob": 1.0,
@@ -307,7 +319,13 @@ class GraphSpawner:
                                 "final_score": score,
                             }
                         scored_edges.append((components, edge))
-                    ranked = self.pattern_bn.rank_spawn_edges(pattern, spawn_node, spawn_edges)
+                    ranked = self.pattern_bn.rank_spawn_edges(
+                        pattern,
+                        spawn_node,
+                        spawn_edges,
+                        frequent_pattern=freq,
+                        graph=self.data_graph,
+                    )
                     ranked_spawn_edges = [edge for _, edge in ranked]
                     self.stats.bn_pruned += len(spawn_edges) - len(ranked_spawn_edges)
                 else:

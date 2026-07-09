@@ -17,8 +17,6 @@ DATA_DIR = Path(os.environ.get("GARPLUS_DATA_DIR", str(BASE_DIR / DEFAULT_DATA_S
 PROCESSED_DIR = Path(os.environ.get("GARPLUS_PROCESSED_DIR", str(BASE_DIR / "processed")))
 PATTERN_DEBUG = os.environ.get("GARPLUS_PATTERN_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 PATTERN_DEBUG_LIMIT = int(os.environ.get("GARPLUS_PATTERN_DEBUG_LIMIT", "500"))
-STRUCTURAL_EDGE_LABEL = os.environ.get("GARPLUS_STRUCTURAL_EDGE_LABEL", "0").strip().lower() in {"1", "true", "yes", "on"}
-STRUCTURAL_EDGE_LABEL_ATTR = os.environ.get("GARPLUS_STRUCTURAL_EDGE_LABEL_ATTR", "direct_evidence_category")
 
 
 RELATION = RelationGraphConfig(
@@ -56,9 +54,21 @@ CONFIG = GarplusRunConfig(
     fallback_node_name="gene.csv",
     force_edge_label="gene_disease",
     edge_label_column="EdgeLabel",
-    structural_edge_label_enabled=STRUCTURAL_EDGE_LABEL,
-    structural_edge_label_attr=STRUCTURAL_EDGE_LABEL_ATTR,
     pattern_bn_cache_path=str(PROCESSED_DIR / "ti" / "pattern_bn.pkl"),
+    enable_pattern_bn=True,
+    tau_p=0.0,
+    pattern_bn_relative_tau=0.5,
+    pattern_bn_top_k_per_spawn_node=4,
+    pattern_bn_min_keep_per_spawn_node=1,
+    augment_structural_features=True,
+    retrain_pattern_bn=True,
+    enable_predicate_bn=True,
+    tau_x=0.05,
+    predicate_bn_top_k_features=24,
+    predicate_bn_min_keep_features=6,
+    predicate_bn_max_parent_features=16,
+    predicate_bn_feature_score="bic",
+    retrain_predicate_bn=True,
     predicate_bn_focus_targets=("negative", "positive"),
     predicate_bn_cache_path=str(PROCESSED_DIR / "ti" / "predicate_bn_negative.pkl"),
     deduped_rules_output_path=str(PROCESSED_DIR / "ti" / "deduped_rules.txt"),
@@ -91,7 +101,7 @@ CONFIG = GarplusRunConfig(
         enabled=True,
         equivalence_threshold=0.95,
         similarity_threshold=0.80,
-        precomputed_edge_csv_path="/home/yyyy/codework/GARplus/enumeration-discovery/GARplusMiner/GARplus-ml-predicate/gene_disease_signed.csv",
+        precomputed_edge_csv_path="/home/yangsiyi10504/GARplusMiner/GARplus-ml-predicate/gene_disease_signed.csv",
         offline_csv_path=str(PROCESSED_DIR / "ti" / "ml_predicates.csv"),
     ),
 )

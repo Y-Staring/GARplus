@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 """pgmpy-based Pattern Bayesian Network for GARplusMiner.
 
@@ -14,10 +14,26 @@ rank or prune structural expansions before expensive subgraph matching.
 
 import os
 import pickle
+import sys
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-from graph_types import DataGraph, GraphPattern, SpawnEdge
+_BN_ROOT = Path(__file__).resolve().parents[1]
+if str(_BN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BN_ROOT))
+
+from BNlearning.pattern_bn_features import (  # noqa: E402
+    BNEdgeLabelFn,
+    BNNodeLabelFn,
+    aggregate_spawn_node_label,
+    build_default_bn_label_fns,
+    default_bn_edge_label,
+    default_bn_node_label,
+    default_bn_node_label_for_pattern_node,
+)
+from graph_types import DataGraph, FrequentPattern, GraphPattern, SpawnEdge
 
 
 CandidateScore = Tuple[float, SpawnEdge]
@@ -30,6 +46,7 @@ class PatternBNConfig:
     enabled: bool = True
     top_k_per_spawn_node: Optional[int] = None
     min_score: float = 0.0
+    relative_tau: Optional[float] = None
     min_keep_per_spawn_node: int = 1
     estimator: str = "bayesian"  # bayesian | maximum_likelihood
     equivalent_sample_size: float = 5.0
@@ -37,6 +54,9 @@ class PatternBNConfig:
     retrain: bool = False
     frequent_edge_priors: Dict[Tuple[str, str, str], float] = field(default_factory=dict)
     frequent_prior_weight: float = 0.25
+    bn_edge_label_fn: Optional[BNEdgeLabelFn] = None
+    bn_node_label_fn: Optional[BNNodeLabelFn] = None
+    use_marginal_edge_score: bool = True
 
 
 class PatternBayesianNetwork:
@@ -66,6 +86,12 @@ class PatternBayesianNetwork:
         bn.fit(graph)
         return bn
 
+    def _edge_label_fn(self) -> BNEdgeLabelFn:
+        return self.config.bn_edge_label_fn or default_bn_edge_label
+
+    def _node_label_fn(self) -> BNNodeLabelFn:
+        return self.config.bn_node_label_fn or default_bn_node_label
+
     def fit(self, graph: DataGraph) -> None:
         """Train the Pattern BN with pgmpy from directed graph-edge samples."""
 
@@ -75,12 +101,21 @@ class PatternBayesianNetwork:
             self.__dict__.update(cached.__dict__)
             self.config = cached.config
             return
-        pd, model_cls, estimator_cls = _load_pgmpy(self.config.estimator)
+        if self.config.bn_edge_label_fn is None or self.config.bn_node_label_fn is None:
+            edge_fn, node_fn = build_default_bn_label_fns(graph)
+            if self.config.bn_edge_label_fn is None:
+                self.config.bn_edge_label_fn = edge_fn
+            if self.config.bn_node_label_fn is None:
+                self.config.bn_node_label_fn = node_fn
+
+        edge_fn = self._edge_label_fn()
+        node_fn = self._node_label_fn()
+        pd, model_cls, _ = _load_pgmpy(self.config.estimator)
         rows = []
         for edge in graph.all_edges():
-            src_label = str(graph.vertices[edge.src].label)
-            dst_label = str(graph.vertices[edge.dst].label)
-            edge_label = str(edge.label)
+            src_label = node_fn(edge.src, graph)
+            dst_label = node_fn(edge.dst, graph)
+            edge_label = edge_fn(edge, graph)
             rows.append(
                 {
                     self.SRC_LABEL: src_label,
@@ -111,15 +146,12 @@ class PatternBayesianNetwork:
                 (self.EDGE_LABEL, self.DST_LABEL),
             ]
         )
-        if self.config.estimator == "maximum_likelihood":
-            self.model.fit(self.data)
-        else:
-            self.model.fit(
-                self.data,
-                estimator=estimator_cls,
-                prior_type="BDeu",
-                equivalent_sample_size=self.config.equivalent_sample_size,
-            )
+        _fit_pgmpy_model(
+            self.model,
+            self.data,
+            self.config.estimator,
+            self.config.equivalent_sample_size,
+        )
 
         self._save_cache_if_needed()
 
@@ -132,16 +164,31 @@ class PatternBayesianNetwork:
         with open(self.config.cache_path, "wb") as handle:
             pickle.dump(self, handle)
 
-    def score_spawn_edge(self, pattern: GraphPattern, spawn_node: int, spawn_edge: SpawnEdge) -> float:
+    def score_spawn_edge(
+        self,
+        pattern: GraphPattern,
+        spawn_node: int,
+        spawn_edge: SpawnEdge,
+        frequent_pattern: Optional[FrequentPattern] = None,
+        graph: Optional[DataGraph] = None,
+    ) -> float:
         """Score one candidate expansion from learned pgmpy CPDs."""
 
-        return self.score_spawn_edge_components(pattern, spawn_node, spawn_edge)["final_score"]
+        return self.score_spawn_edge_components(
+            pattern,
+            spawn_node,
+            spawn_edge,
+            frequent_pattern=frequent_pattern,
+            graph=graph,
+        )["final_score"]
 
     def score_spawn_edge_components(
         self,
         pattern: GraphPattern,
         spawn_node: int,
         spawn_edge: SpawnEdge,
+        frequent_pattern: Optional[FrequentPattern] = None,
+        graph: Optional[DataGraph] = None,
     ) -> Dict[str, float]:
         """Return CPD and sampled-frequency contributions to one spawn score."""
 
@@ -161,24 +208,41 @@ class PatternBayesianNetwork:
                 "frequent_prior": 0.0,
                 "final_score": 0.0,
             }
-        src_label = str(pattern.node_labels[spawn_node])
+        node_fn = self._node_label_fn()
+        src_label = self._resolve_src_label(pattern, spawn_node, frequent_pattern, graph)
         direction = str(spawn_edge.direction)
-        edge_label = str(spawn_edge.edge_label)
-        dst_label = str(spawn_edge.target_label)
-        edge_prob = _cpd_probability(
-            self.model,
-            self.EDGE_LABEL,
-            edge_label,
-            {self.SRC_LABEL: src_label, self.DIRECTION: direction},
-        )
-        dst_prob = _cpd_probability(
-            self.model,
-            self.DST_LABEL,
-            dst_label,
-            {self.SRC_LABEL: src_label, self.DIRECTION: direction, self.EDGE_LABEL: edge_label},
-        )
-        bn_score = edge_prob * dst_prob
-        frequent_prior = self._frequent_edge_prior(src_label, dst_label, edge_label)
+        if spawn_edge.external or spawn_edge.to_node == -1:
+            dst_label = f"plabel:{spawn_edge.target_label}"
+        elif graph is not None and frequent_pattern is not None:
+            dst_label = aggregate_spawn_node_label(pattern, spawn_edge.to_node, graph, frequent_pattern, node_fn)
+        else:
+            dst_label = default_bn_node_label_for_pattern_node(
+                pattern,
+                spawn_edge.to_node,
+                graph or DataGraph(vertices={}),
+                node_fn,
+            )
+
+        structural_edge_label = str(spawn_edge.edge_label)
+        if self.config.use_marginal_edge_score:
+            edge_prob, dst_prob, bn_score = self._marginal_spawn_score(src_label, direction, dst_label)
+        else:
+            bn_edge_label = f"struct:{structural_edge_label}"
+            edge_prob = _cpd_probability(
+                self.model,
+                self.EDGE_LABEL,
+                bn_edge_label,
+                {self.SRC_LABEL: src_label, self.DIRECTION: direction},
+            )
+            dst_prob = _cpd_probability(
+                self.model,
+                self.DST_LABEL,
+                dst_label,
+                {self.SRC_LABEL: src_label, self.DIRECTION: direction, self.EDGE_LABEL: bn_edge_label},
+            )
+            bn_score = edge_prob * dst_prob
+
+        frequent_prior = self._frequent_edge_prior(src_label, dst_label, structural_edge_label)
         prior_weight = min(1.0, max(0.0, float(self.config.frequent_prior_weight)))
         if self.config.frequent_edge_priors:
             final_score = (1.0 - prior_weight) * bn_score + prior_weight * frequent_prior
@@ -192,17 +256,101 @@ class PatternBayesianNetwork:
             "final_score": final_score,
         }
 
+    def _dst_probability(self, src_label: str, direction: str, edge_state: str, dst_label: str) -> float:
+        dst_states = [str(state) for state in self.state_names.get(self.DST_LABEL, [])]
+        if not dst_states:
+            return 0.0
+        evidence = {
+            self.SRC_LABEL: src_label,
+            self.DIRECTION: direction,
+            self.EDGE_LABEL: edge_state,
+        }
+        if dst_label in dst_states:
+            return _cpd_probability(self.model, self.DST_LABEL, dst_label, evidence)
+        best = 0.0
+        for state in dst_states:
+            best = max(best, _cpd_probability(self.model, self.DST_LABEL, state, evidence))
+        return best
+
+    def _edge_probability(self, src_label: str, direction: str, edge_state: str) -> float:
+        return _cpd_probability(
+            self.model,
+            self.EDGE_LABEL,
+            edge_state,
+            {self.SRC_LABEL: src_label, self.DIRECTION: direction},
+        )
+
+    def _resolve_src_label(
+        self,
+        pattern: GraphPattern,
+        spawn_node: int,
+        frequent_pattern: Optional[FrequentPattern],
+        graph: Optional[DataGraph],
+    ) -> str:
+        node_fn = self._node_label_fn()
+        if graph is not None and frequent_pattern is not None and frequent_pattern.instances:
+            return aggregate_spawn_node_label(pattern, spawn_node, graph, frequent_pattern, node_fn)
+        states = [str(state) for state in self.state_names.get(self.SRC_LABEL, [])]
+        if states:
+            return Counter(self.data[self.SRC_LABEL].tolist()).most_common(1)[0][0] if self.data is not None else states[0]
+        return default_bn_node_label_for_pattern_node(pattern, spawn_node, graph or DataGraph(vertices={}), node_fn)
+
+    def _marginal_spawn_score(self, src_label: str, direction: str, dst_label: str) -> Tuple[float, float, float]:
+        edge_states = [str(state) for state in self.state_names.get(self.EDGE_LABEL, [])]
+        if not edge_states:
+            return 0.0, 0.0, 0.0
+        best_edge = 0.0
+        best_dst = 0.0
+        best_joint = 0.0
+        for edge_state in edge_states:
+            p_edge = self._edge_probability(src_label, direction, edge_state)
+            p_dst = self._dst_probability(src_label, direction, edge_state, dst_label)
+            joint = p_edge * p_dst
+            best_edge = max(best_edge, p_edge)
+            best_dst = max(best_dst, p_dst)
+            best_joint = max(best_joint, joint)
+        return best_edge, best_dst, best_joint
+
     def _frequent_edge_prior(self, src_label: str, dst_label: str, edge_label: str) -> float:
         left, right = sorted([str(src_label), str(dst_label)])
         return float(self.config.frequent_edge_priors.get((left, right, str(edge_label)), 0.0))
 
-    def rank_spawn_edges(self, pattern: GraphPattern, spawn_node: int, candidates: Iterable[SpawnEdge]) -> List[CandidateScore]:
+    def _effective_min_score(self, scored: List[Tuple[float, SpawnEdge]]) -> float:
+        if not scored:
+            return self.config.min_score
+        max_score = max(item[0] for item in scored)
+        relative = self.config.relative_tau
+        if relative is not None and relative > 0.0:
+            return max(self.config.min_score, relative * max_score)
+        return self.config.min_score
+
+    def rank_spawn_edges(
+        self,
+        pattern: GraphPattern,
+        spawn_node: int,
+        candidates: Iterable[SpawnEdge],
+        frequent_pattern: Optional[FrequentPattern] = None,
+        graph: Optional[DataGraph] = None,
+    ) -> List[CandidateScore]:
         """Rank and optionally prune VSpawn actions with pgmpy CPDs."""
 
         candidate_list = list(candidates)
-        scored = [(self.score_spawn_edge(pattern, spawn_node, candidate), candidate) for candidate in candidate_list]
+        scored = [
+            (
+                self.score_spawn_edge(
+                    pattern,
+                    spawn_node,
+                    candidate,
+                    frequent_pattern=frequent_pattern,
+                    graph=graph,
+                ),
+                candidate,
+            )
+            for candidate in candidate_list
+        ]
         scored.sort(key=lambda item: item[0], reverse=True)
-        thresholded = [item for item in scored if item[0] >= self.config.min_score]
+        cutoff = self._effective_min_score(scored)
+        thresholded = [item for item in scored if item[0] >= cutoff]
         threshold_pruned = len(scored) - len(thresholded)
         min_keep = max(0, self.config.min_keep_per_spawn_node)
         min_keep_target = min(min_keep, len(scored))
@@ -237,11 +385,13 @@ class PatternBayesianNetwork:
             "candidates_kept": self.total_candidates_kept,
             "candidates_pruned": self.total_candidates_seen - self.total_candidates_kept,
             "tau_p": self.config.min_score,
+            "relative_tau": self.config.relative_tau,
             "threshold_pruned": self.total_threshold_pruned,
             "topk_pruned": self.total_topk_pruned,
             "min_keep_rescued": self.total_min_keep_rescued,
             "frequent_edge_prior_count": len(self.config.frequent_edge_priors),
             "frequent_prior_weight": self.config.frequent_prior_weight,
+            "bn_state_counts": {key: len(values) for key, values in self.state_names.items()},
             "top_snapshot": self.last_rank_snapshot,
         }
 
@@ -265,6 +415,37 @@ def _load_pgmpy(estimator: str):
     return pd, ModelCls, EstimatorCls
 
 
+def _fit_pgmpy_model(model, data, estimator: str, equivalent_sample_size: float) -> None:
+    """Use pgmpy 1.1 discrete estimators when available, otherwise fall back to pgmpy<=1.0."""
+
+    try:
+        from pgmpy.parameter_estimator import DiscreteBayesianEstimator, DiscreteMLE
+    except ModuleNotFoundError:
+        from pgmpy.estimators import BayesianEstimator, MaximumLikelihoodEstimator
+
+        if estimator == "maximum_likelihood":
+            model.fit(data, estimator=MaximumLikelihoodEstimator)
+        else:
+            model.fit(
+                data,
+                estimator=BayesianEstimator,
+                prior_type="BDeu",
+                equivalent_sample_size=equivalent_sample_size,
+            )
+        return
+
+    if estimator == "maximum_likelihood":
+        model.fit(data, estimator=DiscreteMLE())
+    else:
+        model.fit(
+            data,
+            estimator=DiscreteBayesianEstimator(
+                prior_type="BDeu",
+                equivalent_sample_size=equivalent_sample_size,
+            ),
+        )
+
+
 def _cpd_probability(model, variable: str, state: str, evidence: Dict[str, str]) -> float:
     """Read a local CPD probability with graceful zero for unseen states."""
 
@@ -286,7 +467,6 @@ def _cpd_probability(model, variable: str, state: str, evidence: Dict[str, str])
         return float(values[state_index])
     except Exception:
         return 0.0
-
 
 
 

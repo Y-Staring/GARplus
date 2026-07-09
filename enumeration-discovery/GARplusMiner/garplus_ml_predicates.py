@@ -89,6 +89,15 @@ def _any_overlap(left: Mapping[str, object], right: Mapping[str, object], pairs:
     return False
 
 
+def _pred_from_raw(value: object) -> Optional[str]:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return "yes"
+    if text in {"0", "false", "no", "n"}:
+        return "no"
+    return None
+
+
 def _bucket(score: float) -> str:
     if score >= 0.80:
         return "high"
@@ -162,6 +171,7 @@ def _canonical_pair(x: object, y: object, undirected: bool = True) -> Optional[t
 def _edge_original_pair(graph: DataGraph, edge, undirected: bool = True) -> Optional[tuple[int, int]]:
     attrs = edge.attrs
     key_pairs = (
+        ("relation_src_index", "relation_dst_index"),
         ("sampled_src_original_id", "sampled_dst_original_id"),
         ("src_original_id", "dst_original_id"),
         ("index_a", "index_b"),
@@ -381,8 +391,9 @@ def inject_ml_predicates(graph: DataGraph, dataset_name: str, config: MLPredicat
                 except (TypeError, ValueError):
                     score = _score_edge(graph, dataset_name, edge.src, edge.dst, edge.attrs)
                 raw_pred = edge.attrs.get("equivalence_pred")
-                if raw_pred in (0, 1, "0", "1"):
-                    pred = "yes" if int(raw_pred) == 1 else "no"
+                parsed_pred = _pred_from_raw(raw_pred)
+                if parsed_pred is not None:
+                    pred = parsed_pred
                     precomputed += 1
                 else:
                     pred = "yes" if score >= threshold else "no"
@@ -413,8 +424,9 @@ def inject_ml_predicates(graph: DataGraph, dataset_name: str, config: MLPredicat
             except (TypeError, ValueError):
                 continue
             raw_pred = edge.attrs.get("similarity_pred")
-            if raw_pred in (0, 1, "0", "1"):
-                pred = "yes" if int(raw_pred) == 1 else "no"
+            parsed_pred = _pred_from_raw(raw_pred)
+            if parsed_pred is not None:
+                pred = parsed_pred
             else:
                 pred = "yes" if score >= threshold else "no"
             bucket = _bucket(score)

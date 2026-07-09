@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import time
@@ -14,8 +14,6 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_SUBDIR = "\u53bb\u75c5\u56fe\u6570\u636e"
 DATA_DIR = Path(os.environ.get("GARPLUS_DATA_DIR", str(BASE_DIR / DEFAULT_DATA_SUBDIR)))
 PROCESSED_DIR = Path(os.environ.get("GARPLUS_PROCESSED_DIR", str(BASE_DIR / "processed")))
-STRUCTURAL_EDGE_LABEL = os.environ.get("GARPLUS_STRUCTURAL_EDGE_LABEL", "0").strip().lower() in {"1", "true", "yes", "on"}
-STRUCTURAL_EDGE_LABEL_ATTR = os.environ.get("GARPLUS_STRUCTURAL_EDGE_LABEL_ATTR", "experimental_system_type")
 
 
 CONFIG = GarplusRunConfig(
@@ -33,9 +31,21 @@ CONFIG = GarplusRunConfig(
     fallback_node_name="protein.csv",
     force_edge_label="candidate_interaction",
     edge_label_column="Experimental System",
-    structural_edge_label_enabled=STRUCTURAL_EDGE_LABEL,
-    structural_edge_label_attr=STRUCTURAL_EDGE_LABEL_ATTR,
-    pattern_bn_cache_path=str(PROCESSED_DIR / "ppi" / "pattern_bn.pkl"),
+    pattern_bn_cache_path=str(PROCESSED_DIR / "ppi" / "pattern_bn_strict.pkl"),
+    enable_pattern_bn=True,
+    tau_p=0.0,
+    pattern_bn_relative_tau=0.5,
+    pattern_bn_top_k_per_spawn_node=4,
+    pattern_bn_min_keep_per_spawn_node=1,
+    augment_structural_features=True,
+    retrain_pattern_bn=True,
+    enable_predicate_bn=True,
+    tau_x=0.05,
+    predicate_bn_top_k_features=24,
+    predicate_bn_min_keep_features=6,
+    predicate_bn_max_parent_features=16,
+    predicate_bn_feature_score="bic",
+    retrain_predicate_bn=True,
     predicate_bn_cache_path=str(PROCESSED_DIR / "ppi" / "predicate_bn_negative.pkl"),
     deduped_rules_output_path=str(PROCESSED_DIR / "ppi" / "deduped_rules.txt"),
     include_ml_predicate_targets=False,
@@ -80,7 +90,7 @@ CONFIG = GarplusRunConfig(
         enabled=True,
         equivalence_threshold=0.80,
         similarity_threshold=0.85,
-        precomputed_edge_csv_path="/home/yyyy/codework/GARplus/enumeration-discovery/GARplusMiner/GARplus-ml-predicate/protein_protein_signed.csv",
+        precomputed_edge_csv_path="/home/yangsiyi10504/GARplusMiner/GARplus-ml-predicate/protein_protein_signed.csv",
         offline_csv_path=str(PROCESSED_DIR / "ppi" / "ml_predicates.csv"),
     ),
 )
