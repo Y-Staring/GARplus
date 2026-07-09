@@ -41,7 +41,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "\u53bb\u75c5\u56fe\u6570\u636e"
 PROCESSED_DIR = BASE_DIR / "processed"
 
-ACTIVE_DATASET = "DDA"
+ACTIVE_DATASET = "PPI"
 LABEL_COLUMN = "interaction_label"
 NEGATIVE_VALUE = "negative"
 SIMILARITY_THRESHOLD = 0.85
@@ -49,7 +49,7 @@ ONLY_LABELS = MISSING_LABELS | NEUTRAL_LABELS
 OVERWRITE_EXISTING = False
 ALLOW_POSITIVE_RELABEL = False
 ALLOW_EXISTING_NEGATIVE_RELABEL = False
-EXPANSION_MODE = "candidate_non_edges"  # "anchored_existing_edge_labeling", "existing_edge_labeling", "matched_existing", "candidate_non_edges", or "body_rematch_non_edges"
+EXPANSION_MODE = "anchored_existing_edge_labeling"  # "anchored_existing_edge_labeling", "existing_edge_labeling", "matched_existing", "candidate_non_edges", or "body_rematch_non_edges"
 MAX_CANDIDATES_PER_ANCHOR = 50
 MAX_NEW_NEG_PER_NODE = 100
 MAX_NEW_NEG_TOTAL = None
@@ -164,7 +164,7 @@ DATASET_CONFIGS = {
         input_csv=DATA_DIR / "drug_disease_signed.csv",
         output_csv=PROCESSED_DIR / "dda" / "rule_negative_pairs_existing_edge_labeling.csv" 
         if (EXPANSION_MODE == "anchored_existing_edge_labeling") 
-        else PROCESSED_DIR / "dda" / "rule_positive_negative_pairs_0707.csv",
+        else PROCESSED_DIR / "dda" / "rule_negative_pairs_0626.csv",
         rules_file=PROCESSED_DIR / "dda" / "deduped_rules.txt",
         pattern_instances_file=PROCESSED_DIR / "dda" / "pattern_instances.jsonl",
         source_node_csv=DATA_DIR / "drug.csv",
@@ -178,7 +178,7 @@ DATASET_CONFIGS = {
         input_csv=DATA_DIR / "gene_disease_signed.csv",
         output_csv=PROCESSED_DIR / "ti" / "rule_negative_pairs_existing_edge_labeling.csv" 
         if (EXPANSION_MODE == "anchored_existing_edge_labeling") 
-        else PROCESSED_DIR / "ti" / "rule_positive_negative_pairs_0707.csv",
+        else PROCESSED_DIR / "ti" / "rule_negative_pairs_0626.csv",
 
         rules_file=PROCESSED_DIR / "ti" / "deduped_rules.txt",
         pattern_instances_file=PROCESSED_DIR / "ti" / "pattern_instances.jsonl",
@@ -779,8 +779,12 @@ def make_synthetic_instance_from_anchor(
     return synthetic
 
 
-def is_rule_allowed_for_new_edge(rule: NegativeExpansionRule, require_pair_or_context: bool = True) -> bool:
-    if consequent_target_edge(rule) != "e0" or rule.predicted_label not in EXPORT_LABELS:
+def is_rule_allowed_for_new_edge(
+    rule: NegativeExpansionRule,
+    negative_value: str = NEGATIVE_VALUE,
+    require_pair_or_context: bool = True,
+) -> bool:
+    if consequent_target_edge(rule) != "e0" or rule.predicted_label != negative_value:
         return False
     antecedent = rule.antecedent
     if not antecedent:
@@ -923,8 +927,11 @@ def rule_usable_for_existing_edge_labeling(rule: NegativeExpansionRule) -> bool:
     return True
 
 
-def rule_usable_for_anchored_existing_edge_labeling(rule: NegativeExpansionRule) -> bool:
-    if rule.predicted_label not in EXPORT_LABELS:
+def rule_usable_for_anchored_existing_edge_labeling(
+    rule: NegativeExpansionRule,
+    negative_value: str = NEGATIVE_VALUE,
+) -> bool:
+    if rule.predicted_label != negative_value:
         return False
     if consequent_target_edge(rule) != "e0":
         return False
@@ -1376,7 +1383,9 @@ def expand_candidate_non_edges(
     skipped_rule_not_allowed = 0
     for rule_index, rule in enumerate(rules):
         if not is_rule_allowed_for_new_edge(
-            rule, config.require_rule_has_pair_or_context
+            rule,
+            config.negative_value,
+            config.require_rule_has_pair_or_context,
         ):
             skipped_rule_not_allowed += 1
             continue
@@ -1727,7 +1736,7 @@ def expand_existing_edges_as_negative_anchored(config: ExpansionConfig) -> dict[
     structural_rule_items: list[tuple[int, NegativeExpansionRule, dict[str, tuple[str, str]]]] = []
     skipped_no_schema = 0
     for rule_index, rule in enumerate(rules):
-        if not rule_usable_for_anchored_existing_edge_labeling(rule):
+        if not rule_usable_for_anchored_existing_edge_labeling(rule, config.negative_value):
             continue
         schema = pattern_schemas.get(rule.pattern_id)
         if not schema or "e0" not in schema:
@@ -2263,5 +2272,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

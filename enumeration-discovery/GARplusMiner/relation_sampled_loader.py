@@ -230,6 +230,10 @@ def _append_negative_edges(
             attrs.setdefault("interaction_label", "negative")
             attrs.setdefault("sampled_src_original_id", src_orig)
             attrs.setdefault("sampled_dst_original_id", dst_orig)
+            _, src_source_id = _node_kind(src_orig, cfg)
+            _, dst_source_id = _node_kind(dst_orig, cfg)
+            attrs.setdefault("relation_src_index", src_source_id)
+            attrs.setdefault("relation_dst_index", dst_source_id)
             attrs.setdefault("augmented_negative_edge", "yes")
             _promote_edge_attrs_to_nodes(vertices[src_node], vertices[dst_node], attrs, cfg)
             edge_label = force_edge_label or _normalize_edge_label(row.get("EdgeLabel", cfg.default_edge_label))
@@ -317,6 +321,10 @@ def load_relation_sampled_pt_graph(
             attrs.setdefault("sampled_dst_local_id", local_dst)
             attrs.setdefault("sampled_src_original_id", orig_src)
             attrs.setdefault("sampled_dst_original_id", orig_dst)
+            _, src_source_id = _node_kind(orig_src, relation_config)
+            _, dst_source_id = _node_kind(orig_dst, relation_config)
+            attrs.setdefault("relation_src_index", src_source_id)
+            attrs.setdefault("relation_dst_index", dst_source_id)
             attrs.setdefault(interaction_label_column, "unknown")
             _promote_edge_attrs_to_nodes(vertices[graph_src], vertices[graph_dst], attrs, relation_config)
             pending_edges.append((graph_src, graph_dst, edge_label, attrs))
@@ -395,3 +403,8 @@ def build_source_seed_pattern(graph: DataGraph, source_label: str) -> FrequentPa
         if vertex.label == source_label
     ]
     return FrequentPattern(pattern=pattern, instances=instances)
+
+
+
+
+

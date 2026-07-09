@@ -81,7 +81,7 @@ CONFIG = GarplusRunConfig(
     global_rematch_max_instances=None,
     global_match_scope="sampled",
     max_radius = 3,
-    max_add_edge = 3,
+    max_add_edge = 2,
     min_pattern_nodes=None,
     max_pattern_nodes=None,
     enable_rule_payload_generation=False,
@@ -101,7 +101,7 @@ CONFIG = GarplusRunConfig(
         enabled=True,
         equivalence_threshold=0.95,
         similarity_threshold=0.80,
-        precomputed_edge_csv_path="/home/yyyy/codework/GARplus/enumeration-discovery/GARplusMiner/GARplus-ml-predicate/gene_disease_signed.csv",
+        precomputed_edge_csv_path="/home/yangsiyi10504/GARplusMiner/GARplus-ml-predicate/gene_disease_signed.csv",
         offline_csv_path=str(PROCESSED_DIR / "ti" / "ml_predicates.csv"),
     ),
 )
