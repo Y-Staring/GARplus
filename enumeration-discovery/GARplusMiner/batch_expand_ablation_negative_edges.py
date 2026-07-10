@@ -64,6 +64,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--scope-input-csv",
+        default=None,
+        help=(
+            "Interaction CSV used as the expansion/search scope. This overrides "
+            "only input_csv, leaving node CSV paths from --data-dir or the default "
+            "dataset config unchanged. Useful for running anchored labeling on an "
+            "unlabeled large graph such as protein_protein.csv."
+        ),
+    )
+    parser.add_argument(
         "--mode",
         default="anchored_existing_edge_labeling",
         choices=(
@@ -184,6 +194,14 @@ def run_one(
             row.update(
                 status="missing_data",
                 error="; ".join(f"missing {path}" for path in missing_paths),
+            )
+            return row
+    if args.scope_input_csv:
+        path_overrides["input_csv"] = Path(args.scope_input_csv)
+        if not path_overrides["input_csv"].exists():
+            row.update(
+                status="missing_scope_input",
+                error=f"missing {path_overrides['input_csv']}",
             )
             return row
     only_labels = base_config.only_labels if args.only_labels is None else set(args.only_labels)
