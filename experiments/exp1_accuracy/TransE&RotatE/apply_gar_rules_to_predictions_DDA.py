@@ -10,11 +10,9 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
 
-GARPLUS_MINER_DIR = Path(
-    r"/home/yyyy/codework/GARplus/enumeration-discovery/GARplusMiner"
-)
-if str(GARPLUS_MINER_DIR) not in sys.path:
-    sys.path.insert(0, str(GARPLUS_MINER_DIR))
+REFINEMENT_DIR = Path(__file__).resolve().parents[1] / "deductive_refinement"
+if str(REFINEMENT_DIR) not in sys.path:
+    sys.path.insert(0, str(REFINEMENT_DIR))
 
 from negative_edge_expander import (  # noqa: E402
     anchored_body_match_exists,

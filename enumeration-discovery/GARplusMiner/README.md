@@ -109,3 +109,11 @@ Recommended link-prediction setup:
 - Keep the interaction type / experimental system as the structural edge label.
 - Put positive/negative in an edge attribute column, not as the pattern edge label.
 - Set `Y_KEY` to that edge attribute, so generated rules become `X -> e0.xxx=positive` or `X -> e0.xxx=negative`.
+
+## Repository boundary
+
+This directory contains the complete reusable mining flow only: graph loading,
+pattern matching/extension, BN guidance, predicate construction/selection, and
+rule generation. Paper-specific batch sweeps, refinement, plotting, model
+training, and ablations live under `../../experiments/`; start from
+`../../experiments/README.md` to map an entrypoint to a paper table or figure.

@@ -1,4 +1,6 @@
 **/outputs/
+**/__pycache__/
+*.py[cod]
 
 GNN/code/data
 checkpoints/
@@ -8,6 +10,8 @@ checkpoints/
 *.npy
 *.zip
 *.csv
+!experiments/exp1_robustness/rule_mining/mappings/**/*.csv
+!experiments/exp1_robustness/rule_mining/mappings/*.csv
 *.npz
 *.json
 logs/
